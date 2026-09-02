@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mockup Studio — видео в рамке iPhone</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='9' y='2' width='14' height='28' rx='4' fill='%23111' stroke='%23888'/></svg>">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ============ ЛЕВАЯ ПАНЕЛЬ ============ -->
+  <aside id="panel">
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <div class="brand-t">Mockup Studio</div>
+        <div class="brand-s">локально, без подписок</div>
+      </div>
+    </div>
+
+    <details open>
+      <summary>1 · Видео</summary>
+      <div class="body">
+        <label class="drop" id="drop">
+          <input type="file" id="fileVideo" accept="video/*" multiple hidden>
+          <b>Перетащи видео сюда</b>
+          <span>можно сразу несколько · mp4, mov, webm</span>
+        </label>
+        <div class="meta" id="videoMeta">Видео нет — показан демо-экран. Можно выбрать сразу несколько файлов.</div>
+        <button class="ghost" id="btnClearVideo" disabled>Убрать все видео</button>
+
+        <div class="row">
+          <label>Вписать</label>
+          <select id="screenFit">
+            <option value="cover">Заполнить (обрезать)</option>
+            <option value="contain">Целиком (поля)</option>
+            <option value="stretch">Растянуть</option>
+          </select>
+        </div>
+        <div class="row"><label>Зум экрана</label><input type="range" id="screenZoom" min="0.5" max="2.5" step="0.01" value="1"><output></output></div>
+        <div class="row"><label>Сдвиг X</label><input type="range" id="screenOffX" min="-0.5" max="0.5" step="0.005" value="0"><output></output></div>
+        <div class="row"><label>Сдвиг Y</label><input type="range" id="screenOffY" min="-0.5" max="0.5" step="0.005" value="0"><output></output></div>
+        <div class="row"><label>Поля</label><input type="color" id="screenBg" value="#000000"></div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>2 · Устройство</summary>
+      <div class="body">
+        <div class="row">
+          <label>Модель</label>
+          <select id="device"></select>
+        </div>
+        <div class="chips" id="frameColors"></div>
+        <div class="row"><label>Толщина корпуса</label><input type="range" id="thickK" min="0.6" max="1.35" step="0.01" value="0.88"><output></output></div>
+        <div class="row"><label>Кнопки</label><input type="checkbox" id="showButtons" checked></div>
+        <div class="row"><label>Блик стекла</label><input type="checkbox" id="glareOn" checked></div>
+        <div class="row"><label>Сила блика</label><input type="range" id="glareAmt" min="0" max="0.4" step="0.005" value="0.1"><output></output></div>
+        <div class="row"><label>Статус-бар</label><input type="checkbox" id="sbOn"></div>
+        <div class="row"><label>Цвет статус-бара</label>
+          <select id="sbStyle"><option value="light">Белый</option><option value="dark">Чёрный</option></select>
+        </div>
+        <div class="row"><label>Время</label><input type="text" id="sbTime" value="9:41" maxlength="7"></div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>3 · Положение</summary>
+      <div class="body">
+        <div class="chips" id="poses"></div>
+        <div class="row"><label>Размер</label><input type="range" id="pScale" min="0.25" max="2.2" step="0.005" value="1"><output></output></div>
+        <div class="row"><label>По X</label><input type="range" id="pX" min="-0.6" max="0.6" step="0.002" value="0"><output></output></div>
+        <div class="row"><label>По Y</label><input type="range" id="pY" min="-0.6" max="0.6" step="0.002" value="0"><output></output></div>
+        <div class="row"><label>Наклон ↕</label><input type="range" id="pRx" min="-55" max="55" step="0.5" value="0"><output></output></div>
+        <div class="row"><label>Поворот ↔</label><input type="range" id="pRy" min="-55" max="55" step="0.5" value="0"><output></output></div>
+        <div class="row"><label>Вращение ⟳</label><input type="range" id="pRz" min="-45" max="45" step="0.5" value="0"><output></output></div>
+        <div class="row"><label>Перспектива</label><input type="range" id="pPersp" min="900" max="6000" step="50" value="2600"><output></output></div>
+        <button class="ghost" id="resetPose">Сбросить положение</button>
+        <div class="hint">На холсте: тяни мышью — двигать · <b>Shift</b>+тяни — вращать · колесо — размер</div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>4 · Сценарий ролика</summary>
+      <div class="body">
+        <div class="meta"><b style="color:#c6ccdc">Готовые ролики</b> — раскладывают сцены на дорожку целиком:</div>
+        <div class="chips" id="reels"></div>
+        <div class="meta" style="margin-top:6px"><b style="color:#c6ccdc">Приёмы</b> — нажми, и сцена встанет в место плейхеда:</div>
+        <div class="chips" id="scenarios"></div>
+        <div class="meta" id="scMeta"></div>
+        <div class="row"><label>Сила сценария</label><input type="range" id="mAmount" min="0" max="1.6" step="0.01" value="1"><output></output></div>
+        <div class="row"><label>Живость</label><input type="range" id="mIdle" min="0" max="1.5" step="0.01" value="0.12"><output></output></div>
+        <div class="row"><label>Плавность</label><input type="range" id="scEase" min="0" max="1" step="0.01" value="0.55"><output></output></div>
+        <div class="row two">
+          <button class="ghost" id="tempoSlow">Медленнее ×1.25</button>
+          <button class="ghost" id="tempoFast">Быстрее ×0.8</button>
+        </div>
+        <button class="ghost" id="scClear">Очистить дорожку сцен</button>
+        <div class="hint">«Плавность» 0 — постоянная скорость, 100 — мягкий разгон и торможение; в середине пик скорости почти вдвое выше средней, поэтому на длинных отъездах ставь меньше. Масштаб интерполируется логарифмически: приближение читается как отношение, а не как разность, и «улёта» в конце нет. «Медленнее/быстрее» растягивают все сцены на дорожке разом.</div>
+        <div class="hint">Каждая сцена — один приём продуктовой съёмки: проезд по экрану, взгляд снизу с отъездом, разворот с бликом, витрина с движущимся светом. На дорожке сцены тянутся и растягиваются; между соседними — уход в чёрное. После последней камера замирает, запись можно продолжать.</div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>5 · Наезд на участок</summary>
+      <div class="body">
+        <div class="meta" id="fcMeta">Наездов нет. Добавь их на дорожке снизу кнопкой «+ Наезд».</div>
+        <button id="btnSelect">Переобвести участок</button>
+        <div class="row"><label>Заполнение</label><input type="range" id="fcFill" min="0.4" max="1" step="0.01" value="0.82"><output></output></div>
+        <div class="row"><label>Плавность, с</label><input type="range" id="fcRamp" min="0.15" max="6" step="0.05" value="0.9"><output></output></div>
+        <button class="ghost" id="fcDelete">Удалить выбранный наезд</button>
+        <div class="hint">На дорожке «наезды» блок можно тянуть, растягивать за края и удалять крестиком. Двойной клик по блоку — переобвести участок экрана. Чем длиннее «плавность», тем мягче въезд и выезд.</div>
+      </div>
+    </details>
+
+    <details>
+      <summary>6 · Фон</summary>
+      <div class="body">
+        <div class="swatches" id="bgPresets"></div>
+        <div class="row"><label>Цвет A</label><input type="color" id="bgA" value="#12141b"></div>
+        <div class="row"><label>Цвет B</label><input type="color" id="bgB" value="#05060a"></div>
+        <div class="row"><label>Тип</label>
+          <select id="bgType">
+            <option value="studio">Студия (свет и пол)</option>
+            <option value="linear">Линейный градиент</option>
+            <option value="radial">Радиальное свечение</option>
+            <option value="solid">Однотонный</option>
+            <option value="mesh">Mesh-градиент</option>
+            <option value="image">Картинка</option>
+            <option value="none">Прозрачный</option>
+          </select>
+        </div>
+        <div class="row"><label>Угол</label><input type="range" id="bgAngle" min="0" max="360" step="1" value="135"><output></output></div>
+        <label class="drop small">
+          <input type="file" id="fileBg" accept="image/*" hidden>
+          <b>Фоновая картинка</b><span>нажми, чтобы выбрать</span>
+        </label>
+        <div class="row"><label>Размытие фона</label><input type="range" id="bgBlur" min="0" max="60" step="1" value="0"><output></output></div>
+        <div class="row"><label>Затемнение</label><input type="range" id="bgDim" min="0" max="0.85" step="0.01" value="0"><output></output></div>
+        <div class="row"><label>Виньетка</label><input type="range" id="vignette" min="0" max="0.9" step="0.01" value="0.25"><output></output></div>
+        <div class="row"><label>Зерно</label><input type="range" id="grain" min="0" max="0.25" step="0.005" value="0"><output></output></div>
+      </div>
+    </details>
+
+    <details>
+      <summary>7 · Тень</summary>
+      <div class="body">
+        <div class="row"><label>Тень</label><input type="checkbox" id="shOn" checked></div>
+        <div class="row"><label>Плотность</label><input type="range" id="shOpacity" min="0" max="1" step="0.01" value="0.5"><output></output></div>
+        <div class="row"><label>Размытие</label><input type="range" id="shBlur" min="0" max="220" step="1" value="90"><output></output></div>
+        <div class="row"><label>Смещение X</label><input type="range" id="shX" min="-200" max="200" step="1" value="0"><output></output></div>
+        <div class="row"><label>Смещение Y</label><input type="range" id="shY" min="-150" max="300" step="1" value="60"><output></output></div>
+        <div class="row"><label>Разлёт</label><input type="range" id="shSpread" min="0.6" max="1.6" step="0.01" value="1.02"><output></output></div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>8 · Эффекты</summary>
+      <div class="body">
+        <div class="row"><label>Глубина резкости</label><input type="checkbox" id="dofOn" checked></div>
+        <div class="row"><label>Сила размытия</label><input type="range" id="dofAmt" min="0" max="1" step="0.01" value="0.5"><output></output></div>
+        <div class="row"><label>Отражение в полу</label><input type="checkbox" id="reflOn" checked></div>
+        <div class="row"><label>Сила отражения</label><input type="range" id="reflAmt" min="0" max="0.8" step="0.01" value="0.32"><output></output></div>
+        <div class="row"><label>Тень «острова»</label><input type="checkbox" id="fxIsland" checked></div>
+        <div class="row"><label>Засветка рамки</label><input type="checkbox" id="fxGlow" checked></div>
+        <div class="row"><label>Сила засветки</label><input type="range" id="fxGlowAmt" min="0" max="1" step="0.01" value="0.45"><output></output></div>
+        <div class="hint">Задник размывается, когда телефон близко. Отражение рисуется только на студийном фоне и когда телефон стоит (наклон до 30°). Засветка — средний цвет экрана ложится на стекло вокруг него.</div>
+      </div>
+    </details>
+
+    <details>
+      <summary>9 · Текст</summary>
+      <div class="body">
+        <div class="row"><label>Показывать</label><input type="checkbox" id="txOn"></div>
+        <div class="row"><label>Заголовок</label><input type="text" id="txTitle" value="Твоё приложение"></div>
+        <div class="row"><label>Подпись</label><input type="text" id="txSub" value="Уже в App Store"></div>
+        <div class="row"><label>Позиция</label>
+          <select id="txPos"><option value="top">Сверху</option><option value="bottom">Снизу</option></select>
+        </div>
+        <div class="row"><label>Размер</label><input type="range" id="txSize" min="20" max="140" step="1" value="66"><output></output></div>
+        <div class="row"><label>Цвет</label><input type="color" id="txColor" value="#ffffff"></div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>10 · Экспорт</summary>
+      <div class="body">
+        <div class="row">
+          <label>Формат кадра</label>
+          <select id="sizePreset"></select>
+        </div>
+        <div class="row two">
+          <input type="number" id="cw" min="240" max="3840" step="2" value="1080">
+          <input type="number" id="ch" min="240" max="3840" step="2" value="1920">
+        </div>
+        <div class="row"><label>FPS</label>
+          <select id="fps"><option>24</option><option selected>30</option><option>60</option></select>
+        </div>
+        <div class="row"><label>Битрейт, Мбит/с</label><input type="range" id="bitrate" min="2" max="40" step="1" value="14"><output></output></div>
+        <div class="row"><label>Со звуком</label><input type="checkbox" id="withAudio"></div>
+        <div class="row"><label>Длительность, с</label><input type="number" id="expDur" min="1" max="120" step="0.5" value="0"><span class="sfx">0 = длина видео</span></div>
+        <button class="primary" id="btnRecord">● Записать видео</button>
+        <button class="ghost" id="btnPng">Сохранить кадр PNG</button>
+        <div class="meta" id="expMeta"></div>
+      </div>
+    </details>
+
+    <details>
+      <summary>Как получить mp4</summary>
+      <div class="body">
+        <div class="hint">
+          Браузер пишет <b>.webm</b> (в Safari — сразу mp4). Чтобы конвертировать:
+          <code>./to-mp4.sh ~/Downloads/mockup.webm</code>
+          Скрипт лежит в папке проекта и использует ffmpeg.
+        </div>
+      </div>
+    </details>
+  </aside>
+
+  <!-- ============ СЦЕНА ============ -->
+  <main id="main">
+    <div id="stage">
+      <div id="canvasWrap">
+        <canvas id="c" width="1080" height="1920"></canvas>
+      </div>
+    </div>
+
+    <div id="timeline">
+      <div id="tlbar">
+        <button id="btnPlay" class="tbtn" title="Пробел">▶</button>
+        <button id="btnStart" class="tbtn" title="В начало">⏮</button>
+        <button id="btnLoop" class="tbtn" title="Повтор по кругу">↻</button>
+        <div class="tc"><span id="tCur">0.0</span> / <span id="tDur">0.0</span> с</div>
+        <button id="btnAddZoom" class="tbtn wide">+ Наезд</button>
+        <div class="spacer"></div>
+        <div class="tc" id="dims">1080×1920</div>
+        <button id="btnRecord2" class="tbtn recbtn">● Записать</button>
+      </div>
+      <div id="tlwrap">
+        <div id="tlruler"></div>
+        <div class="trk" id="trkVideo"><canvas id="strip"></canvas><i class="trklabel">видео</i><div id="vEnd" hidden></div></div>
+        <div class="trk" id="trkZoom"><i class="trklabel">наезды</i></div>
+        <div class="trk" id="trkScene"><i class="trklabel">сценарий</i></div>
+        <div id="playhead"></div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<div id="overlay" hidden>
+  <div class="card">
+    <div class="ov-title">Запись…</div>
+    <div class="bar"><i id="ovBar"></i></div>
+    <div class="ov-sub" id="ovSub">Не переключай вкладку — запись идёт в реальном времени.</div>
+    <button class="ghost" id="ovCancel">Отменить</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<video id="v" playsinline muted loop crossorigin="anonymous"></video>
+
+<script src="app.js"></script>
+</body>
+</html>
