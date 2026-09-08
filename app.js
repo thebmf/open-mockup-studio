@@ -400,6 +400,7 @@ const S = {
   sel: null,                 // id выбранного наезда
   exp: { fps: 30, bitrate: 14, audio: false, dur: 0 },
   sizePreset: 'p1080',
+  tl: { pps: 0 },             // масштаб таймлайна, пикселей на секунду; 0 — ещё не инициализирован
 };
 
 const canvas = $('#c');
@@ -415,16 +416,31 @@ let mediaSeq = 1;
 const newMediaId = () => 'm' + (mediaSeq++);
 let hasVideo = false;            // есть хотя бы одно готовое видео
 
-/* Переходы между соседними клипами видеодорожки — просто уход в чёрное на
-   стыке, без собственного медиа-содержимого, поэтому им не нужен pool.     */
+/* Переходы — просто уход в чёрное, без собственного медиа-содержимого,
+   поэтому им не нужен pool. Каждый переход сидит на краю ('in'|'out') одного
+   клипа; вид (стык / затемнение в начале / в конце) считается на лету при
+   отрисовке — см. isStitch() и transFade() ниже (брифинг, раздел C).       */
 let transSeq = 1;
 const newTransId = () => 't' + (transSeq++);
 function getTrans(id) { return S.trans.find(x => x.id === id) || null; }
-function transAfter(afterId) { return S.trans.find(x => x.after === afterId) || null; }
+function transOnEdge(clipId, edge) { return S.trans.find(x => x.clip === clipId && x.edge === edge) || null; }
 
 function mediaEnd(m) { return m.t0 + m.dur; }
 function sortedMedia() { return S.media.slice().sort((a, b) => a.t0 - b.t0); }
 function getMedia(id) { return S.media.find(m => m.id === id) || null; }
+/* Следующий по времени клип после m — или null, если m последний. */
+function nextMediaOf(m) {
+  const list = sortedMedia();
+  const i = list.findIndex(x => x.id === m.id);
+  return i >= 0 ? (list[i + 1] || null) : null;
+}
+/* 'out'-край клипа — стык, если сразу за ним (без зазора) стоит другой клип:
+   тогда затемнение рисуется как двусторонний «нырок» на границе, а не внутрь
+   одного клипа. 'in'-край стыком не бывает — см. C.1 в брифе.              */
+function isStitch(m) {
+  const n = nextMediaOf(m);
+  return !!(n && Math.abs(n.t0 - mediaEnd(m)) < 0.05);
+}
 
 /* Какой клип звучит и виден в момент t. */
 function mediaAt(t) {
@@ -1552,17 +1568,32 @@ function sceneFade(t) {
   return smoother(clamp(f, 0, 1));
 }
 
-/* Уход в чёрное на переходе между двумя клипами видеодорожки — крестфейд
-   даёт затемнение и там, и там, максимум ровно на середине стыка.        */
+/* Затемнение переходов. Три вида, максимум по всем — сглаживается один раз
+   в конце (см. C.1 в брифе):
+   - 'out' на стыке (сразу за клипом стоит другой) — крестфейд-«нырок»:
+     чёрное ровно на границе, спад по dur/2 в обе стороны;
+   - 'out' без соседа (последний клип или зазор дальше) — уход в чёрное
+     ВНУТРИ клипа, [end-dur, end], от 0 к 1;
+   - 'in' — затемнение внутри начала клипа, [t0, t0+dur], от 1 к 0.        */
 function transFade(t) {
   let f = 0;
   for (const tr of S.trans) {
-    const a = getMedia(tr.after);
+    const a = getMedia(tr.clip);
     if (!a) continue;
-    const e = mediaEnd(a);
-    const half = tr.dur / 2;
-    const dt = Math.abs(t - e);
-    if (dt < half) f = Math.max(f, 1 - dt / half);
+    if (tr.edge === 'out') {
+      if (isStitch(a)) {
+        const e = mediaEnd(a);
+        const half = tr.dur / 2;
+        const dt = Math.abs(t - e);
+        if (dt < half) f = Math.max(f, 1 - dt / half);
+      } else {
+        const e = mediaEnd(a), start = e - tr.dur;
+        if (t >= start && t <= e) f = Math.max(f, (t - start) / tr.dur);
+      }
+    } else {   // 'in'
+      const start = a.t0, e = a.t0 + tr.dur;
+      if (t >= start && t <= e) f = Math.max(f, 1 - (t - start) / tr.dur);
+    }
   }
   return smoother(clamp(f, 0, 1));
 }
@@ -2018,6 +2049,7 @@ async function addVideoFiles(files) {
   const list = [...files].filter(f => f.type.startsWith('video/'));
   if (!list.length) return;
   const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
+  const wasEmpty = !S.media.length;
   let at = mediaDur();
   let added = 0;
   for (const f of list) {
@@ -2027,6 +2059,10 @@ async function addVideoFiles(files) {
   if (!added) return;
   pushHist(preSnap);
   S.selMedia = S.media[S.media.length - 1].id;
+  // Первое видео на пустой дорожке — масштаб таймлайна ещё не подобран под
+  // реальную длину (или это вообще самый первый рендер), поэтому подгоняем
+  // его сразу; дальше зум трогают только явные действия (см. A.5 в брифе).
+  if (wasEmpty || !S.tl.pps) fitZoom();
   updateVideoMeta();
   renderTimeline();
   scheduleStrip();
@@ -2037,6 +2073,7 @@ async function addVideoFiles(files) {
 function loadVideoUrl(url) {
   const id = newMediaId();
   const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
+  const wasEmpty = !S.media.length;
   const v = document.createElement('video');
   v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
   v.addEventListener('loadedmetadata', () => {
@@ -2047,19 +2084,23 @@ function loadVideoUrl(url) {
     S.media.push({ id, name: url, t0: mediaDur(), dur: Math.round(nat * 100) / 100, inPoint: 0 });
     hasVideo = true;
     S.selMedia = id;
+    if (wasEmpty || !S.tl.pps) fitZoom();
     updateVideoMeta(); renderTimeline(); scheduleStrip(); setPlaying(true);
   }, { once: true });
 }
 
 /* ================================================= undo/redo ============ */
-/* Снимок держит только то, что реально правится монтажом: три дорожки,
-   переходы и что сейчас выбрано. Поза/устройство/экспорт и т.п. в историю
-   не попадают — им отдельный undo не нужен и не запрашивался.             */
+/* Снимок держит то, что реально правится монтажом: три дорожки, переходы,
+   что сейчас выбрано, и клок — иначе после undo плейхед остаётся там, где
+   его застала операция, а не там, где он был до неё (см. B.1 в брифе).
+   Поза/устройство/экспорт и т.п. в историю не попадают — им отдельный undo
+   не нужен и не запрашивался.                                             */
 const hist = { undo: [], redo: [] };
 function snap() {
   return JSON.stringify({
     media: S.media, clips: S.clips, scenes: S.scenes, trans: S.trans,
     selMedia: S.selMedia, sel: S.sel, selScene: S.selScene, selTrans: S.selTrans,
+    clock,
   });
 }
 function updateHistButtons() {
@@ -2076,21 +2117,28 @@ function applySnap(s) {
   const o = JSON.parse(s);
   S.media = o.media; S.clips = o.clips; S.scenes = o.scenes; S.trans = o.trans || [];
   S.selMedia = o.selMedia; S.sel = o.sel; S.selScene = o.selScene; S.selTrans = o.selTrans || null;
+  if (isFinite(o.clock)) clock = o.clock;
 }
 function undo() {
   if (!hist.undo.length) return;
   hist.redo.push(snap());
   applySnap(hist.undo.pop());
+  clock = clamp(clock, 0, sceneDuration());
+  syncMedia(clock, playing);
   renderTimeline(); updateVideoMeta(); updateFocusMeta(); updateSceneMeta(); scheduleStrip(); save(); gcPool();
   updateHistButtons();
+  updatePlayhead();
   toast('Отменено');
 }
 function redo() {
   if (!hist.redo.length) return;
   hist.undo.push(snap());
   applySnap(hist.redo.pop());
+  clock = clamp(clock, 0, sceneDuration());
+  syncMedia(clock, playing);
   renderTimeline(); updateVideoMeta(); updateFocusMeta(); updateSceneMeta(); scheduleStrip(); save(); gcPool();
   updateHistButtons();
+  updatePlayhead();
   toast('Повторено');
 }
 
@@ -2164,10 +2212,18 @@ function splitMediaAt(t = clock) {
      (inPoint у правой продолжает inPoint левой без разрыва) — поэтому
      syncMedia не перематывает video при переходе через границу раздела.   */
   mediaPool[rightId] = mediaPool[m.id];
-  for (const tr of S.trans) if (tr.after === m.id) tr.after = rightId;
+  // 'out' (затемнение у конца m) уезжает вместе с концом — теперь это правая
+  // половина; 'in' (у начала m) остаётся на месте — начало не сдвинулось.
+  for (const tr of S.trans) if (tr.clip === m.id && tr.edge === 'out') tr.clip = rightId;
   S.selMedia = rightId;
   S.selTrans = null;
+  // Клок не трогаем — split режет ровно по плейхеду, ему двигаться некуда
+  // (см. B.1 в брифе). Клэмп/синк/апдейт всё равно проговариваем явно —
+  // так же, как в trim/delete — чтобы кадр под плейхедом не разошёлся с DOM.
+  clock = clamp(clock, 0, sceneDuration());
+  syncMedia(clock, playing);
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
+  updatePlayhead();
   toast('Разделено');
 }
 
@@ -2199,7 +2255,15 @@ function trimToPlayhead(side) {
   }
   S.selMedia = m.id;
   S.selTrans = null;
+  // 'head': кадр, что был под плейхедом, теперь оказывается в самом начале
+  // клипа (t0 у m не сдвигается, см. комментарий выше про inPoint) — значит
+  // и клок ставим на t0, чтобы дальше показывался тот же кадр, а не другой
+  // (см. B.1 в брифе). 'tail': плейхед и так уже на новом конце — не трогаем.
+  if (side === 'head') clock = m.t0;
+  clock = clamp(clock, 0, sceneDuration());
+  syncMedia(clock, playing);
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
+  updatePlayhead();
   toast(side === 'head' ? 'Обрезано до плейхеда' : 'Обрезано после плейхеда');
 }
 
@@ -2212,15 +2276,34 @@ function deleteMedia(id) {
   if (i < 0) return;
   pushHist();
   const m = S.media[i];
-  const name = m.name, end = mediaEnd(m), dur = m.dur;
+  const name = m.name, t0 = m.t0, end = mediaEnd(m), dur = m.dur;
   S.media.splice(i, 1);
+  // Было ли вообще что подтягивать? Если удалённый клип был последним, ripple
+  // никого не двигает — тогда плейхед, стоявший на его конце или дальше,
+  // трогать незачем (там и так уже ничего нет, до и после удаления).
+  const hadFollowing = S.media.some(other => other.t0 >= end - 1e-3);
   for (const other of S.media) {
     if (other.t0 >= end - 1e-3) other.t0 = Math.round((other.t0 - dur) * 100) / 100;
   }
-  S.trans = S.trans.filter(tr => tr.after !== id);
+  S.trans = S.trans.filter(tr => tr.clip !== id);   // удаление клипа убирает все его переходы
   if (S.selMedia === id) S.selMedia = null;
   gcPool();
+  // Ripple сдвигает всё, что было правее удалённого куска, — плейхед должен
+  // поехать вместе с содержимым, которое теперь под ним, иначе он «прыгнет»
+  // на другой кадр без видимой причины (см. B.1 в брифе):
+  //  - плейхед был правее удалённого клипа, и что-то реально подтянулось →
+  //    едет вместе с этим содержимым (та же секунда того же ролика);
+  //  - плейхед был правее, но дальше и так было пусто (клип последний) →
+  //    двигать некуда и незачем, оставляем как есть;
+  //  - плейхед стоял внутри удалённого клипа → показывать больше нечего,
+  //    ставим на его бывшее начало (там теперь то, что раньше шло следом);
+  //  - плейхед был левее — его вообще не касается.
+  if (clock >= end - 1e-6) { if (hadFollowing) clock -= dur; }
+  else if (clock >= t0) clock = t0;
+  clock = clamp(clock, 0, sceneDuration());
+  syncMedia(clock, playing);
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
+  updatePlayhead();
   toast(`Видео убрано: ${name.length > 22 ? name.slice(0, 22) + '…' : name}`);
 }
 
@@ -2243,8 +2326,10 @@ function clearVideo() {
   S.media = []; S.trans = [];
   S.selMedia = null; S.selTrans = null;
   hasVideo = false;
+  fitZoom();   // видео пропало — масштаб таймлайна должен снова влезать в оставшийся контент
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   seekTo(0);
+  $('#tlwrap').scrollLeft = 0;
   toast('Все видео убраны');
 }
 
@@ -2256,15 +2341,26 @@ function selectMedia(id) {
   updateVideoMeta(); save();
 }
 
+/* Подпись вида перехода для панели — «на стыке» (крестфейд между двумя
+   клипами), «в начале»/«в конце» (уход в чёрное внутрь одного клипа, когда
+   соседа нет) — см. C.7 в брифе.                                          */
+function transKindLabel(tr) {
+  const a = getMedia(tr.clip);
+  if (!a) return '';
+  if (tr.edge === 'out') return isStitch(a) ? 'на стыке' : 'в конце';
+  return 'в начале';
+}
+
 function updateVideoMeta() {
   const el = $('#videoMeta');
   $('#btnClearVideo').disabled = !S.media.length;
+  $('#btnTrans').disabled = !S.media.length;
 
   const tr = getTrans(S.selTrans);
   if (tr) {
     // Панель не перестраиваем на каждый 'input' — иначе ползунок пересоздаётся
     // прямо под курсором во время протяжки. Обновляем только текст подписи.
-    el.innerHTML = `Переход · затемнение <span id="transDurLabel">${tr.dur.toFixed(1)}</span> с` +
+    el.innerHTML = `Переход · ${transKindLabel(tr)} · <span id="transDurLabel">${tr.dur.toFixed(1)}</span> с` +
       `<div class="row" style="margin-top:6px"><input type="range" id="transDurRange" min="0.2" max="2" step="0.1" value="${tr.dur}"></div>` +
       `<button class="ghost" id="btnTransDelete" style="margin-top:6px">Удалить переход</button>`;
     const range = $('#transDurRange');
@@ -2411,7 +2507,10 @@ function seekTo(t) {
 }
 
 $('#btnPlay').addEventListener('click', () => setPlaying(!playing));
-$('#btnStart').addEventListener('click', () => { seekTo(0); });
+// «В начало» — единственное место, где seekTo(0) ещё и возвращает прокрутку
+// таймлайна к нулю (см. A.4 в брифе); во всех остальных случаях scrollLeft
+// трогает только автослежение во время playing/recording внутри updatePlayhead().
+$('#btnStart').addEventListener('click', () => { seekTo(0); $('#tlwrap').scrollLeft = 0; updatePlayhead(); });
 
 window.addEventListener('keydown', e => {
   const tag = (e.target.tagName || '').toLowerCase();
@@ -2429,6 +2528,10 @@ window.addEventListener('keydown', e => {
     if (e.key === 's' || e.key === 'ы') { e.preventDefault(); splitMediaAt(); return; }
     if (e.key === 'q' || e.key === 'й') { e.preventDefault(); trimToPlayhead('head'); return; }
     if (e.key === 'w' || e.key === 'ц') { e.preventDefault(); trimToPlayhead('tail'); return; }
+    if (e.key === 't' || e.key === 'е') { e.preventDefault(); addTransitionAtPlayhead(); return; }
+    if (e.key === '-' || e.key === '_') { e.preventDefault(); setZoom(S.tl.pps / 1.25, clock); return; }
+    if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoom(S.tl.pps * 1.25, clock); return; }
+    if (e.key === '0') { e.preventDefault(); fitZoom(); return; }
   }
   if (e.key === 'r' || e.key === 'к') resetPose();
   if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -2440,10 +2543,36 @@ window.addEventListener('keydown', e => {
 });
 
 /* ================================================= таймлайн ============ */
+/* Масштаб полосы фиксирован в пикселях на секунду (S.tl.pps), а не растянут
+   на всю ширину #tlwrap — иначе любая обрезка меняла масштаб ВСЕЙ полосы, и
+   плейхед «прыгал» при неизменном clock (жалоба из брифа, раздел A). tlDur()
+   пересчитан в «сколько секунд условно занимает вся ширина #tlcontent» —
+   tToPct/xToT/layoutMedia/layoutScene/layoutClip/freeSlot/snapT продолжают работать без переписывания,
+   потому что явно завязаны только на tlDur(), а не на sceneDuration().     */
 
 const trackEl = () => $('#trkZoom');
-const tlDur   = () => Math.max(0.1, sceneDuration());
-const tToPct  = t => clamp(t / tlDur(), 0, 1) * 100;
+
+/* Видимая ширина #tlwrap без его собственных левых/правых паддингов —
+   именно столько пикселей контента реально помещается в один экран. */
+function tlViewW() {
+  const wrap = $('#tlwrap');
+  const cs = getComputedStyle(wrap);
+  const pl = parseFloat(cs.paddingLeft) || 0, pr = parseFloat(cs.paddingRight) || 0;
+  return Math.max(50, wrap.clientWidth - pl - pr);
+}
+
+/* Ширина #tlcontent в px: контент плюс запас справа (tailSec), чтобы при
+   укорачивании ролика (trim/delete) ширина не схлопывалась резко и
+   scrollLeft не сбрасывался куда-то в середину видимой области.          */
+function contentW() {
+  const pps = S.tl.pps || 1;
+  const viewW = tlViewW();
+  const tailSec = Math.max(2, 0.25 * viewW / pps);
+  return Math.max(viewW, (sceneDuration() + tailSec) * pps);
+}
+
+const tlDur  = () => contentW() / (S.tl.pps || 1);
+const tToPct = t => clamp(t / tlDur(), 0, 1) * 100;
 
 function xToT(clientX) {
   const r = trackEl().getBoundingClientRect();
@@ -2475,6 +2604,126 @@ function snapT(t, excludeId) {
   }
   return best;
 }
+
+/* --------------------------------------------- зум и прокрутка (раздел A) */
+
+/* Минимальный масштаб — весь ролик влезает в экран целиком (плюс запас 2с),
+   максимальный — 400 px/с. Используется и как нижняя граница setZoom(), и
+   как проверка в layoutTimeline() на случай, если pps ещё не инициализирован. */
+function ppsFitMin() { return tlViewW() / Math.max(3, sceneDuration() + 2); }
+
+/* Меняет масштаб, сохраняя экранную позицию времени anchorT (по умолчанию —
+   плейхед): секунда под курсором/плейхедом остаётся под тем же пикселем.   */
+function setZoom(pps, anchorT) {
+  const wrap = $('#tlwrap');
+  const t = anchorT === undefined ? clock : anchorT;
+  const oldPps = S.tl.pps || ppsFitMin() || 1;
+  const anchorScreenX = t * oldPps - wrap.scrollLeft;
+  S.tl.pps = clamp(pps, Math.max(1, ppsFitMin()), 400);
+  layoutTimeline();
+  scheduleStrip();   // кадры пока растянуты CSS-ом — перерисовать под новую ширину (с дебаунсом)
+  wrap.scrollLeft = clamp(t * S.tl.pps - anchorScreenX, 0, Math.max(0, contentW() - tlViewW()));
+  save();
+}
+
+/* «По размеру» — весь ролик виден целиком, без горизонтальной прокрутки.
+   Только эта функция и явный вызов кнопкой/при первом видео/при очистке
+   меняют масштаб сами по себе — монтажные операции (split/trim/delete/drag)
+   его никогда не трогают, см. раздел A.5 в брифе.
+   pps=(viewW-8)/(sceneDuration()*1.04) в лоб не годится: contentW() поверх
+   sceneDuration() всегда добавляет свой хвост tailSec (не меньше 2с, см.
+   contentW() выше), а этот хвост от выбранного pps и сам зависит — поэтому
+   решаем численно (бисекция по contentW(pps) <= viewW), иначе после fitZoom
+   полоса прокрутки всё равно остаётся (см. AC-Z2 в брифе).                */
+function fitZoom() {
+  const wrap = $('#tlwrap');
+  // contentW() сам содержит max(viewW, …) — раз он никогда не бывает МЕНЬШЕ
+  // viewW, целиться нужно ровно в viewW (+0.5 запаса на плавающую точку), а
+  // не в viewW-N: такая цель недостижима в принципе, из-за чего бисекция
+  // схлопывалась к нижней границе (pps=1) вместо реального решения.
+  const target = tlViewW() + 0.5;
+  let lo = 1, hi = 400;
+  for (let i = 0; i < 24; i++) {
+    const mid = (lo + hi) / 2;
+    S.tl.pps = mid;
+    if (contentW() <= target) lo = mid; else hi = mid;
+  }
+  S.tl.pps = clamp(lo, 1, 400);
+  layoutTimeline();
+  scheduleStrip();
+  wrap.scrollLeft = 0;
+  save();
+}
+
+/* Шаг линейки — первый из фиксированного набора, у которого расстояние между
+   соседними метками на экране не меньше 64px (см. A.8 в брифе).           */
+const RULER_STEPS = [0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60];
+function rulerStep(pps) {
+  for (const s of RULER_STEPS) if (s * pps >= 64) return s;
+  return RULER_STEPS[RULER_STEPS.length - 1];
+}
+function rulerLabel(t, step) {
+  if (t < 60) return (step < 1 ? t.toFixed(1) : t.toFixed(0)) + 'с';
+  const mm = Math.floor(t / 60 + 1e-9), ss = Math.round(t - mm * 60);
+  return mm + ':' + String(ss).padStart(2, '0');
+}
+
+/* Подписи дорожек живут в #tlgutter — вне скроллящегося #tlwrap (см. A.3) —
+   поэтому им нужны только вертикальные офсеты, посчитанные от реальных
+   прямоугольников дорожек; сам #tlgutter садится поверх верхнего левого угла
+   #tlwrap так же через getBoundingClientRect, независимо от разметки.     */
+function syncGutter() {
+  const wrap = $('#tlwrap'), gutter = $('#tlgutter');
+  gutter.style.left = wrap.offsetLeft + 'px';
+  gutter.style.top = wrap.offsetTop + 'px';
+  const wrapRect = wrap.getBoundingClientRect();
+  for (const lbl of gutter.querySelectorAll('.trklabel')) {
+    const trk = document.getElementById(lbl.dataset.for);
+    if (!trk) continue;
+    const r = trk.getBoundingClientRect();
+    lbl.style.top = (r.top - wrapRect.top + 4) + 'px';
+  }
+}
+
+/* Единственное место, которое кладёт пиксельные позиции на дорожку. Не
+   пересоздаёт DOM (см. A.6 в брифе) — только считает размеры и переносит уже
+   существующие элементы; renderTimeline() зовёт её в конце после того, как
+   сама пересобрала список DOM-узлов.                                      */
+function layoutTimeline() {
+  if (!S.tl.pps) S.tl.pps = clamp((tlViewW() - 8) / Math.max(3, sceneDuration() * 1.04), 4, 400);
+
+  const D = tlDur();
+  $('#tlcontent').style.width = contentW() + 'px';
+
+  // линейка
+  const ruler = $('#tlruler');
+  ruler.innerHTML = '';
+  const step = rulerStep(S.tl.pps);
+  for (let i = 0; step * i <= D + 1e-6; i++) {
+    const t = Math.round(i * step * 1000) / 1000;
+    const el = document.createElement('i');
+    el.style.left = tToPct(t) + '%';
+    el.textContent = rulerLabel(t, step);
+    ruler.appendChild(el);
+  }
+
+  for (const m of S.media) layoutMedia(m);
+  for (const b of S.scenes) layoutScene(b);
+  for (const c of S.clips) layoutClip(c);
+  layoutJunctions();
+
+  // конец видео
+  const md = mediaDur();
+  const vEnd = $('#vEnd');
+  if (md > 0 && md < D - 0.05) { vEnd.hidden = false; vEnd.style.left = tToPct(md) + '%'; }
+  else vEnd.hidden = true;
+
+  $('#tDur').textContent = sceneDuration().toFixed(1);
+  syncGutter();
+  updatePlayhead();
+}
+
+window.addEventListener('resize', () => layoutTimeline());
 
 function newClipId() { return 'z' + (clipSeq++); }
 
@@ -2604,17 +2853,86 @@ function selectTrans(id) {
   save();
 }
 
-function addTransition(afterId, dur = 0.5) {
-  const exists = transAfter(afterId);
-  if (exists) { selectTrans(exists.id); return; }
-  if (!getMedia(afterId)) return;
+/* Максимум длительности затемнения для края clipId/edge — общая для
+   addTransitionAt() (дефолт при создании) и setTransDur() (протяжка
+   ползунком), чтобы они не расходились: без этого клип короче дефолтных
+   0.5с получал переход длиннее себя самого при создании, и затемнение
+   выплёскивалось в соседний клип, пока пользователь не трогал ползунок
+   (см. finding #4). На стыке — не больше короткого из двух склеиваемых
+   клипов; у одиночного края ('in'/'out' без соседа) — не больше длины
+   самого клипа (см. C.5 в брифе).                                        */
+function maxTransDur(clipId, edge) {
+  const a = getMedia(clipId);
+  let maxDur = 2.0;
+  if (a) {
+    maxDur = Math.min(maxDur, a.dur);
+    if (edge === 'out' && isStitch(a)) {
+      const next = nextMediaOf(a);
+      if (next) maxDur = Math.min(maxDur, next.dur);
+    }
+  }
+  return maxDur;
+}
+
+/* Низкоуровневый конструктор — ставит переход на конкретный край конкретного
+   клипа. Используется и стыковыми кнопками «+» (edge:'out' у левого клипа),
+   и addTransitionAtPlayhead() ниже. Если такой переход уже есть — просто
+   выбирает его, без второго одинакового перехода на одном крае.           */
+function addTransitionAt(clipId, edge, dur = 0.5) {
+  const exists = transOnEdge(clipId, edge);
+  if (exists) { selectTrans(exists.id); return exists; }
+  if (!getMedia(clipId)) return null;
   pushHist();
-  const tr = { id: newTransId(), after: afterId, dur };
+  const maxDur = maxTransDur(clipId, edge);
+  const clampedDur = Math.round(clamp(dur, 0.2, Math.max(0.2, maxDur)) * 100) / 100;
+  const tr = { id: newTransId(), clip: clipId, edge, dur: clampedDur };
   S.trans.push(tr);
   S.selTrans = tr.id;
   S.selMedia = null;
   renderTimeline(); updateVideoMeta(); save();
   toast('Переход добавлен');
+  return tr;
+}
+
+/* Ближайший край (начало или конец) любого клипа к моменту t, в пределах
+   `within` секунд — для addTransitionAtPlayhead(), когда плейхед стоит не
+   строго внутри клипа, а рядом с его границей.                            */
+function nearestClipEdge(t, within) {
+  let best = null;
+  for (const m of S.media) {
+    const dStart = Math.abs(t - m.t0), dEnd = Math.abs(t - mediaEnd(m));
+    if (dStart <= within && (!best || dStart < best.dist)) best = { clip: m, edge: 'in', dist: dStart };
+    if (dEnd <= within && (!best || dEnd < best.dist)) best = { clip: m, edge: 'out', dist: dEnd };
+  }
+  return best;
+}
+
+/* Кнопка «◆ Переход» / хоткей T — явный способ поставить затемнение, раз уж
+   пользователи не находят кружки «+» на стыках (см. C.2 в брифе). Берёт клип
+   под плейхедом (ближайший из его двух краёв) или ближайший край в пределах
+   секунды; начало клипа, вплотную к которому слева стоит другой, превращается
+   в 'out' у соседа — это тот же стык, что рисует кнопка «+» на границе.    */
+function addTransitionAtPlayhead() {
+  const t = clock;
+  let target = null;
+  const under = clipUnderPlayhead(t);
+  if (under) {
+    const dStart = Math.abs(t - under.t0), dEnd = Math.abs(t - mediaEnd(under));
+    target = { clip: under, edge: dStart <= dEnd ? 'in' : 'out' };
+  } else {
+    const near = nearestClipEdge(t, 1);
+    if (!near) { toast('Поставь плейхед рядом с краем клипа'); return; }
+    target = { clip: near.clip, edge: near.edge };
+  }
+  if (target.edge === 'in') {
+    const list = sortedMedia();
+    const idx = list.findIndex(x => x.id === target.clip.id);
+    const prev = idx > 0 ? list[idx - 1] : null;
+    if (prev && Math.abs(target.clip.t0 - mediaEnd(prev)) < 0.05) target = { clip: prev, edge: 'out' };
+  }
+  const exists = transOnEdge(target.clip.id, target.edge);
+  if (exists) { selectTrans(exists.id); toast('Переход уже есть — выбран'); return; }
+  addTransitionAt(target.clip.id, target.edge);
 }
 
 function deleteTransition(id) {
@@ -2627,18 +2945,14 @@ function deleteTransition(id) {
   toast('Переход удалён');
 }
 
-/* Длительность крестфейда не может быть больше самого короткого из двух
-   склеиваемых клипов — иначе затемнение съест больше, чем в них есть.     */
+/* Длительность затемнения не может быть больше того, что в клипе (клипах)
+   реально есть: на стыке — не больше короткого из двух склеиваемых клипов;
+   у одиночного края ('in'/'out' без соседа) — не больше длины самого клипа
+   (см. C.5 в брифе).                                                      */
 function setTransDur(id, dur) {
   const tr = getTrans(id);
   if (!tr) return;
-  let maxDur = 2.0;
-  const left = getMedia(tr.after);
-  if (left) maxDur = Math.min(maxDur, left.dur);
-  const list = sortedMedia();
-  const li = list.findIndex(x => x.id === tr.after);
-  const right = li >= 0 ? list[li + 1] : null;
-  if (right) maxDur = Math.min(maxDur, right.dur);
+  const maxDur = maxTransDur(tr.clip, tr.edge);
   tr.dur = Math.round(clamp(dur, 0.2, Math.max(0.2, maxDur)) * 100) / 100;
   // Панель #videoMeta тут намеренно не перестраиваем: это дёргает ползунок
   // прямо во время протяжки (input срабатывает на каждый шаг) — обновляем
@@ -2758,6 +3072,24 @@ for (const id of ['#tlruler', '#trkVideo', '#trkScene', '#trkZoom']) {
   ['pointerup', 'pointercancel'].forEach(ev => el.addEventListener(ev, () => scrubbing = false));
 }
 
+/* Колесо на таймлайне (A.7): ⌘/Ctrl — зум вокруг курсора; обычное вертикальное
+   колесо — горизонтальная прокрутка (мышь без трекпада не крутит по X сама);
+   горизонтальный deltaX (трекпад) — отдаём нативной прокрутке #tlwrap.       */
+$('#tlwrap').addEventListener('wheel', e => {
+  const wrap = $('#tlwrap');
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    const r = wrap.getBoundingClientRect();
+    const anchorT = (e.clientX - r.left + wrap.scrollLeft) / (S.tl.pps || 1);
+    setZoom(S.tl.pps * Math.exp(-e.deltaY * 0.0025), anchorT);
+    return;
+  }
+  if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+    e.preventDefault();
+    wrap.scrollLeft += e.deltaY;
+  }
+}, { passive: false });
+
 /* --- отрисовка --- */
 function layoutMedia(m) {
   const el = $('#trkVideo').querySelector(`.clip.media[data-id="${m.id}"]`);
@@ -2795,25 +3127,64 @@ function layoutClip(c) {
   el.querySelector('b').textContent = `Наезд ${c.dur.toFixed(1)} с`;
 }
 
+/* .clip создаёт свой стекинговый контекст (position+z-index), поэтому её
+   ручки обрезки .h (z-index:2 внутри .clip) физически не могут оказаться
+   выше .jn/.tr (z-index:6) — они сравниваются с соседями по z-index самой
+   .clip (2, или 5 у .sel), который меньше 6 в любом случае. Раздвинуть их
+   через z-index нельзя, только геометрией: держим .jn.edge и одиночный
+   (не стыковой) .tr на расстоянии HANDLE_CLEAR+радиус от истинного края
+   клипа, чтобы ручка (12px, см. .clip .h в style.css) оставалась кликабельна
+   (см. finding #1 — было перекрыто 10-11 из 12px хиттеста ручки).         */
+const HANDLE_CLEAR = 15;   // 12px ручка + 3px запас, в экранных px
+const JN_RADIUS = 10;      // половина .jn (20px, border-radius:50%, style.css)
+const EDGE_JN_MIN_W = 2 * (HANDLE_CLEAR + JN_RADIUS) + 8;   // уже — крайнюю «+» прячем
+
 /* Позиции «+»-кнопок и маркеров переходов — отдельно от renderTimeline(),
    чтобы во время перетаскивания клипа они ехали вместе с ним без пересборки
-   всей дорожки (см. C.3 в брифе).                                        */
+   всей дорожки (см. C.3 в брифе). Тоже вызывается из layoutTimeline().    */
 function layoutJunctions() {
   const D = tlDur();
   const trkV = $('#trkVideo');
   const rectW = trkV.getBoundingClientRect().width || 1;
+  const pps = S.tl.pps || 1;
+  const list = sortedMedia();
   for (const jn of [...trkV.querySelectorAll('.jn')]) {
+    if (jn.classList.contains('edge')) {
+      const edgeClip = jn.dataset.role === 'start' ? list[0] : list[list.length - 1];
+      if (!edgeClip) { jn.remove(); continue; }
+      // На клипе уже ~60px кнопка, отодвинутая от ручки, села бы на стыковую
+      // «+» соседа и его ручки — прячем; переход туда всё равно ставится
+      // клавишей T или кнопкой «Переход».
+      jn.style.display = edgeClip.dur * pps < EDGE_JN_MIN_W ? 'none' : '';
+      const px = jn.dataset.role === 'start'
+        ? edgeClip.t0 * pps + HANDLE_CLEAR + JN_RADIUS
+        : mediaEnd(edgeClip) * pps - HANDLE_CLEAR - JN_RADIUS;
+      jn.style.left = (px / rectW * 100) + '%';
+      continue;
+    }
     const a = getMedia(jn.dataset.after);
     if (!a) { jn.remove(); continue; }
     jn.style.left = tToPct(mediaEnd(a)) + '%';
   }
   for (const el of [...trkV.querySelectorAll('.tr')]) {
     const tr = getTrans(el.dataset.id);
-    if (!tr) { el.remove(); continue; }
-    const a = getMedia(tr.after);
-    const center = a ? mediaEnd(a) : 0;
+    const a = tr ? getMedia(tr.clip) : null;
+    if (!tr || !a) { el.remove(); continue; }
     const wPx = Math.max(26, (tr.dur / D) * rectW);
-    el.style.left = tToPct(center) + '%';
+    // стык — маркер по центру границы (как раньше, обеим сторонам своя
+    // ручка не грозит — там нет ручки посередине); одиночный край — маркер
+    // тянется к реальному месту затемнения (C.4), но не ближе HANDLE_CLEAR
+    // к внешнему краю клипа, где иначе накрыл бы его же .h целиком.
+    let centerPx;
+    if (tr.edge === 'out') {
+      const endPx = mediaEnd(a) * pps;
+      centerPx = isStitch(a) ? endPx
+        : Math.min(endPx - tr.dur / 2 * pps, endPx - HANDLE_CLEAR - wPx / 2);
+    } else {
+      const startPx = a.t0 * pps;
+      centerPx = Math.max(startPx + tr.dur / 2 * pps, startPx + HANDLE_CLEAR + wPx / 2);
+    }
+    el.style.left = (centerPx / rectW * 100) + '%';
     el.style.width = wPx + 'px';
     el.classList.toggle('sel', tr.id === S.selTrans);
     const lbl = el.querySelector('.x');
@@ -2822,19 +3193,6 @@ function layoutJunctions() {
 }
 
 function renderTimeline() {
-  const D = tlDur();
-
-  // линейка
-  const ruler = $('#tlruler');
-  ruler.innerHTML = '';
-  const step = D <= 6 ? 1 : D <= 16 ? 2 : D <= 40 ? 5 : 10;
-  for (let t = 0; t <= D + 1e-6; t += step) {
-    const i = document.createElement('i');
-    i.style.left = tToPct(t) + '%';
-    i.textContent = t.toFixed(0) + 'с';
-    ruler.appendChild(i);
-  }
-
   // сцены — такие же клипы на своей дорожке
   const trkS = $('#trkScene');
   [...trkS.querySelectorAll('.clip')].forEach(el => el.remove());
@@ -2879,19 +3237,42 @@ function renderTimeline() {
 
   // стыки между соседними по времени клипами: «+» там, где перехода ещё нет,
   // маркер — там, где уже есть (переход рисуется, даже если клип успел
-  // отъехать и стык распался — это просто уход в чёрное на его конце)
+  // отъехать и стык распался — это просто уход в чёрное на его конце).
+  // Плюс отдельные кнопки-«+» в самом начале первого клипа и в самом конце
+  // последнего — затемнение внутрь клипа, а не стык (см. C.3 в брифе).
   const sm = sortedMedia();
   for (let i = 0; i < sm.length - 1; i++) {
     const a = sm[i], b = sm[i + 1];
     if (Math.abs(b.t0 - mediaEnd(a)) >= 0.05) continue;
-    if (transAfter(a.id)) continue;
+    if (transOnEdge(a.id, 'out')) continue;
     const jn = document.createElement('div');
     jn.className = 'jn';
     jn.dataset.after = a.id;
     jn.textContent = '+';
-    jn.title = 'Добавить переход (затемнение)';
+    jn.title = 'Добавить затемнение';
     jn.addEventListener('pointerdown', e => e.stopPropagation());
-    jn.addEventListener('click', e => { e.stopPropagation(); addTransition(a.id); });
+    jn.addEventListener('click', e => { e.stopPropagation(); addTransitionAt(a.id, 'out'); });
+    trkV.appendChild(jn);
+  }
+  const first = sm[0], last = sm[sm.length - 1];
+  if (first && !transOnEdge(first.id, 'in')) {
+    const jn = document.createElement('div');
+    jn.className = 'jn edge';
+    jn.dataset.role = 'start';
+    jn.textContent = '+';
+    jn.title = 'Добавить затемнение';
+    jn.addEventListener('pointerdown', e => e.stopPropagation());
+    jn.addEventListener('click', e => { e.stopPropagation(); addTransitionAt(first.id, 'in'); });
+    trkV.appendChild(jn);
+  }
+  if (last && !transOnEdge(last.id, 'out')) {
+    const jn = document.createElement('div');
+    jn.className = 'jn edge';
+    jn.dataset.role = 'end';
+    jn.textContent = '+';
+    jn.title = 'Добавить затемнение';
+    jn.addEventListener('pointerdown', e => e.stopPropagation());
+    jn.addEventListener('click', e => { e.stopPropagation(); addTransitionAt(last.id, 'out'); });
     trkV.appendChild(jn);
   }
   for (const tr of S.trans) {
@@ -2903,14 +3284,7 @@ function renderTimeline() {
     el.addEventListener('pointerdown', e => { e.stopPropagation(); selectTrans(tr.id); });
     trkV.appendChild(el);
   }
-  layoutJunctions();
   if (needStrip) scheduleStrip();
-
-  // конец видео
-  const md = mediaDur();
-  const vEnd = $('#vEnd');
-  if (md > 0 && md < D - 0.05) { vEnd.hidden = false; vEnd.style.left = tToPct(md) + '%'; }
-  else vEnd.hidden = true;
 
   // клипы
   const trk = trackEl();
@@ -2928,18 +3302,38 @@ function renderTimeline() {
     trk.appendChild(el);
     layoutClip(c);
   }
-  $('#tDur').textContent = D.toFixed(1);
+
+  // Единая точка, которая знает про масштаб/прокрутку: ширина #tlcontent,
+  // линейка, финальные позиции всего перечисленного выше, «конец видео»,
+  // подписи в #tlgutter и плейхед (см. A.6 в брифе).
+  layoutTimeline();
 }
 
 /* Кэш булева «есть клип под плейхедом» — чтобы не трогать disabled на DOM
    каждый кадр (updatePlayhead вызывается из frame() безусловно).          */
 let editBtnsEnabled = null;
+let lastPhLeft = null;
+/* При фиксированном масштабе позиция плейхеда — просто clock*pps, без всякой
+   геометрии дорожек: это и убирает «прыжки» при монтаже (раздел B в брифе) —
+   пока clock не меняется, красная линия стоит на месте при любой обрезке.  */
 function updatePlayhead() {
-  const wrap = $('#tlwrap');
-  const trk = trackEl();
-  const r = trk.getBoundingClientRect(), w = wrap.getBoundingClientRect();
-  $('#playhead').style.left = (r.left - w.left + (clock / tlDur()) * r.width) + 'px';
+  const pps = S.tl.pps || 1;
+  const x = clock * pps;
+  const left = x + 'px';
+  if (left !== lastPhLeft) { $('#playhead').style.left = left; lastPhLeft = left; }
   $('#tCur').textContent = clock.toFixed(1);
+
+  // Автослежение — только во время воспроизведения/записи и только когда
+  // плейхед реально вышел за видимую область (см. A.4 в брифе); во всех
+  // остальных случаях (монтаж, ручная прокрутка) scrollLeft не трогаем.
+  if (playing || recording) {
+    const wrap = $('#tlwrap');
+    const viewW = tlViewW();
+    const sl = wrap.scrollLeft;
+    if (x < sl + 8 || x > sl + viewW - 8) {
+      wrap.scrollLeft = clamp(x - viewW * 0.2, 0, Math.max(0, contentW() - viewW));
+    }
+  }
 
   const enabled = !!clipUnderPlayhead();
   if (enabled !== editBtnsEnabled) {
@@ -2955,7 +3349,9 @@ function updatePlayhead() {
    (см. renderTimeline) — единой дорожечной полосы больше нет, поэтому кадры
    едут и обрезаются вместе с клипом сами, без ручной синхронизации.       */
 const thumbCache = {};   // id клипа → {key, canvas}: canvas — офскрин-снимок последней отрисовки
-function thumbKey(m, w) { return `${(m.inPoint || 0).toFixed(2)}|${m.dur.toFixed(2)}|${w}`; }
+// Ширину в ключе округляем до 32px-корзины — иначе плавный зум колесом (он
+// меняет px-ширину клипа на каждый тик) сбрасывал бы кэш плёнки каждый кадр.
+function thumbKey(m, w) { return `${(m.inPoint || 0).toFixed(2)}|${m.dur.toFixed(2)}|${Math.round(w / 32) * 32}`; }
 
 let stripToken = 0;
 async function buildFilmstrip() {
@@ -3488,6 +3884,10 @@ function buildUI() {
   $('#btnSplit').addEventListener('click', () => splitMediaAt());
   $('#btnTrimL').addEventListener('click', () => trimToPlayhead('head'));
   $('#btnTrimR').addEventListener('click', () => trimToPlayhead('tail'));
+  $('#btnTrans').addEventListener('click', addTransitionAtPlayhead);
+  $('#btnZoomOut').addEventListener('click', () => setZoom(S.tl.pps / 1.25, clock));
+  $('#btnZoomIn').addEventListener('click', () => setZoom(S.tl.pps * 1.25, clock));
+  $('#btnZoomFit').addEventListener('click', fitZoom);
   $('#btnUndo').addEventListener('click', undo);
   $('#btnRedo').addEventListener('click', redo);
   const syncLoop = () => {
@@ -3609,6 +4009,9 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   get last(){ return lastRender }, get selecting(){ return selecting }, startSelect, endSelect,
   setPose: p => { Object.assign(S.pose, p); syncPoseUI(); },
   setPlaying: v => setPlaying(v),
-  splitMediaAt, trimToPlayhead, addTransition, deleteTransition, setTransDur, transFade, selectTrans,
+  splitMediaAt, trimToPlayhead, addTransition: addTransitionAt, deleteTransition, setTransDur, transFade, selectTrans,
+  addTransitionAtPlayhead,
   undo, redo, hist, gcPool, snapT, thumbCache, layoutJunctions,
+  setZoom, fitZoom, layoutTimeline, contentW, tlViewW, updatePlayhead,
+  get tl() { return S.tl },
   get clock() { return clock } };

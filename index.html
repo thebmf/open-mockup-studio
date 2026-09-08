@@ -240,16 +240,27 @@
         <button id="btnSplit" class="tbtn wide" title="S — разделить по плейхеду" disabled>✂ Разделить</button>
         <button id="btnTrimL" class="tbtn wide" title="Q" disabled>⇤ Отрезать до</button>
         <button id="btnTrimR" class="tbtn wide" title="W" disabled>Отрезать после ⇥</button>
+        <button id="btnTrans" class="tbtn wide" title="T — затемнение на ближайшем крае клипа" disabled>◆ Переход</button>
         <div class="spacer"></div>
+        <button id="btnZoomOut" class="tbtn" title="− — уменьшить масштаб">−</button>
+        <button id="btnZoomIn" class="tbtn" title="= — увеличить масштаб">+</button>
+        <button id="btnZoomFit" class="tbtn" title="0 — по размеру">⤢</button>
         <div class="tc" id="dims">1080×1920</div>
         <button id="btnRecord2" class="tbtn recbtn">● Записать</button>
       </div>
       <div id="tlwrap">
-        <div id="tlruler"></div>
-        <div class="trk" id="trkVideo"><i class="trklabel">видео</i><div id="vEnd" hidden></div></div>
-        <div class="trk" id="trkZoom"><i class="trklabel">наезды</i></div>
-        <div class="trk" id="trkScene"><i class="trklabel">сценарий</i></div>
-        <div id="playhead"></div>
+        <div id="tlcontent">
+          <div id="tlruler"></div>
+          <div class="trk" id="trkVideo"><div id="vEnd" hidden></div></div>
+          <div class="trk" id="trkZoom"></div>
+          <div class="trk" id="trkScene"></div>
+          <div id="playhead"></div>
+        </div>
+      </div>
+      <div id="tlgutter">
+        <i class="trklabel" data-for="trkVideo">видео</i>
+        <i class="trklabel" data-for="trkZoom">наезды</i>
+        <i class="trklabel" data-for="trkScene">сценарий</i>
       </div>
     </div>
 
