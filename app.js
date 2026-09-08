@@ -394,6 +394,8 @@ const S = {
   fx:      { islandShadow: true, glow: true, glowAmt: 0.45 },
   media: [],                 // видео на дорожке: [{id,name,t0,dur,inPoint}]
   selMedia: null,
+  trans: [],                 // переходы между соседними клипами: [{id,after,dur}]
+  selTrans: null,
   clips: [],                 // наезды: [{id,t0,dur,ramp,fill,u0,v0,u1,v1}]
   sel: null,                 // id выбранного наезда
   exp: { fps: 30, bitrate: 14, audio: false, dur: 0 },
@@ -412,6 +414,13 @@ const mediaPool = {};            // id → {video, url, name, natDur, w, h, read
 let mediaSeq = 1;
 const newMediaId = () => 'm' + (mediaSeq++);
 let hasVideo = false;            // есть хотя бы одно готовое видео
+
+/* Переходы между соседними клипами видеодорожки — просто уход в чёрное на
+   стыке, без собственного медиа-содержимого, поэтому им не нужен pool.     */
+let transSeq = 1;
+const newTransId = () => 't' + (transSeq++);
+function getTrans(id) { return S.trans.find(x => x.id === id) || null; }
+function transAfter(afterId) { return S.trans.find(x => x.after === afterId) || null; }
 
 function mediaEnd(m) { return m.t0 + m.dur; }
 function sortedMedia() { return S.media.slice().sort((a, b) => a.t0 - b.t0); }
@@ -1543,6 +1552,21 @@ function sceneFade(t) {
   return smoother(clamp(f, 0, 1));
 }
 
+/* Уход в чёрное на переходе между двумя клипами видеодорожки — крестфейд
+   даёт затемнение и там, и там, максимум ровно на середине стыка.        */
+function transFade(t) {
+  let f = 0;
+  for (const tr of S.trans) {
+    const a = getMedia(tr.after);
+    if (!a) continue;
+    const e = mediaEnd(a);
+    const half = tr.dur / 2;
+    const dt = Math.abs(t - e);
+    if (dt < half) f = Math.max(f, 1 - dt / half);
+  }
+  return smoother(clamp(f, 0, 1));
+}
+
 function composedPose(t) {
   const p = S.pose;
   const A = S.scene.amount;
@@ -1755,7 +1779,7 @@ function draw(t) {
   drawGrain(ctx);
 
   // уход в чёрное на стыке сцен
-  const fade = sel ? 0 : sceneFade(t);
+  const fade = sel ? 0 : Math.max(sceneFade(t), transFade(t));
   if (fade > 0.002) { ctx.fillStyle = `rgba(0,0,0,${fade})`; ctx.fillRect(0, 0, W, H); }
 }
 
@@ -1993,6 +2017,7 @@ function addVideoFile(file, atEnd) {
 async function addVideoFiles(files) {
   const list = [...files].filter(f => f.type.startsWith('video/'));
   if (!list.length) return;
+  const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
   let at = mediaDur();
   let added = 0;
   for (const f of list) {
@@ -2000,6 +2025,7 @@ async function addVideoFiles(files) {
     if (id) { at = mediaDur(); added++; }
   }
   if (!added) return;
+  pushHist(preSnap);
   S.selMedia = S.media[S.media.length - 1].id;
   updateVideoMeta();
   renderTimeline();
@@ -2010,11 +2036,13 @@ async function addVideoFiles(files) {
 
 function loadVideoUrl(url) {
   const id = newMediaId();
+  const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
   const v = document.createElement('video');
   v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
   v.addEventListener('loadedmetadata', () => {
     const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
     if (!nat) return;
+    pushHist(preSnap);
     mediaPool[id] = { video: v, url: null, name: url, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
     S.media.push({ id, name: url, t0: mediaDur(), dur: Math.round(nat * 100) / 100, inPoint: 0 });
     hasVideo = true;
@@ -2023,19 +2051,175 @@ function loadVideoUrl(url) {
   }, { once: true });
 }
 
+/* ================================================= undo/redo ============ */
+/* Снимок держит только то, что реально правится монтажом: три дорожки,
+   переходы и что сейчас выбрано. Поза/устройство/экспорт и т.п. в историю
+   не попадают — им отдельный undo не нужен и не запрашивался.             */
+const hist = { undo: [], redo: [] };
+function snap() {
+  return JSON.stringify({
+    media: S.media, clips: S.clips, scenes: S.scenes, trans: S.trans,
+    selMedia: S.selMedia, sel: S.sel, selScene: S.selScene, selTrans: S.selTrans,
+  });
+}
+function updateHistButtons() {
+  $('#btnUndo').disabled = !hist.undo.length;
+  $('#btnRedo').disabled = !hist.redo.length;
+}
+function pushHist(s = snap()) {
+  hist.undo.push(s);
+  if (hist.undo.length > 60) hist.undo.shift();
+  hist.redo = [];
+  updateHistButtons();
+}
+function applySnap(s) {
+  const o = JSON.parse(s);
+  S.media = o.media; S.clips = o.clips; S.scenes = o.scenes; S.trans = o.trans || [];
+  S.selMedia = o.selMedia; S.sel = o.sel; S.selScene = o.selScene; S.selTrans = o.selTrans || null;
+}
+function undo() {
+  if (!hist.undo.length) return;
+  hist.redo.push(snap());
+  applySnap(hist.undo.pop());
+  renderTimeline(); updateVideoMeta(); updateFocusMeta(); updateSceneMeta(); scheduleStrip(); save(); gcPool();
+  updateHistButtons();
+  toast('Отменено');
+}
+function redo() {
+  if (!hist.redo.length) return;
+  hist.undo.push(snap());
+  applySnap(hist.redo.pop());
+  renderTimeline(); updateVideoMeta(); updateFocusMeta(); updateSceneMeta(); scheduleStrip(); save(); gcPool();
+  updateHistButtons();
+  toast('Повторено');
+}
+
+/* Уборка пула видео. Живой считается pool-запись, на которую ссылается id
+   либо из S.media (дорожка сейчас), либо из любого снимка в hist.undo/redo:
+   после deleteMedia сам клип пропадает из S.media, но его pushHist-снимок
+   «до удаления» держит id живым — поэтому undo возвращает играющий клип, а
+   не пустую запись, и <video>/blob-URL для него не выгружаются заранее.
+   После split два id могут указывать на один и тот же объект {video,url,…}
+   — сравниваем по ссылке на объект, а не по id, чтобы не выгрузить видео,
+   которое всё ещё нужно другой половине клипа.                            */
+function gcPool() {
+  const liveIds = new Set(S.media.map(m => m.id));
+  for (const s of [...hist.undo, ...hist.redo]) {
+    try {
+      const o = JSON.parse(s);
+      if (Array.isArray(o.media)) for (const m of o.media) liveIds.add(m.id);
+    } catch (_) {}
+  }
+  const liveObjs = new Set();
+  for (const id of liveIds) if (mediaPool[id]) liveObjs.add(mediaPool[id]);
+  for (const id of Object.keys(mediaPool)) {
+    if (liveIds.has(id)) continue;
+    const p = mediaPool[id];
+    if (!liveObjs.has(p)) {
+      try {
+        p.video.pause();
+        if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
+        p.video.removeAttribute('src');
+        p.video.load();
+        if (p.url) URL.revokeObjectURL(p.url);
+      } catch (_) {}
+    }
+    delete mediaPool[id];
+  }
+  hasVideo = S.media.some(m => mediaPool[m.id]);
+}
+
+/* ================================================= разделение и обрезка = */
+
+/* Клип, над которым сейчас стоит плейхед — с отступом 0.15с от его краёв:
+   слишком близко к краю резать/делить бессмысленно (получился бы огрызок). */
+function clipUnderPlayhead(t = clock) {
+  return sortedMedia().find(x => t >= x.t0 + 0.15 && t <= mediaEnd(x) - 0.15) || null;
+}
+
+function splitMediaAt(t = clock) {
+  const list = sortedMedia();
+  const m = clipUnderPlayhead(t);
+  if (!m) {
+    const inside = list.some(x => t >= x.t0 && t <= mediaEnd(x));
+    toast(inside ? 'Слишком близко к краю клипа' : 'Поставь плейхед внутрь видео');
+    return;
+  }
+  pushHist();
+  const oldEnd = mediaEnd(m);
+  const rightId = newMediaId();
+  const right = {
+    id: rightId, name: m.name,
+    t0: Math.round(t * 100) / 100,
+    dur: Math.round((oldEnd - t) * 100) / 100,
+    inPoint: Math.round(((m.inPoint || 0) + (t - m.t0)) * 100) / 100,
+  };
+  m.dur = Math.round((t - m.t0) * 100) / 100;
+  S.media.splice(S.media.indexOf(m) + 1, 0, right);
+  /* Разделение делит одну pool-запись на двоих: mediaPool[rightId] — та же
+     ссылка на объект {video,url,...}, что и у левой половины (m.id), один
+     <video> и один blob на обе половины. Это безопасно, потому что клок —
+     ведущий и в любой момент времени активен максимум один клип (mediaAt),
+     а на стыке половин левая заканчивается ровно там, где начинается правая
+     (inPoint у правой продолжает inPoint левой без разрыва) — поэтому
+     syncMedia не перематывает video при переходе через границу раздела.   */
+  mediaPool[rightId] = mediaPool[m.id];
+  for (const tr of S.trans) if (tr.after === m.id) tr.after = rightId;
+  S.selMedia = rightId;
+  S.selTrans = null;
+  updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
+  toast('Разделено');
+}
+
+/* 'head' — отрезать всё до плейхеда (клип остаётся на месте, обрезается
+   содержимое слева через inPoint); 'tail' — отрезать всё после плейхеда.
+   В обоих случаях клипы правее подтягиваются влево на вырезанную длину. */
+function trimToPlayhead(side) {
+  const t = clock;
+  const list = sortedMedia();
+  const m = clipUnderPlayhead(t);
+  if (!m) {
+    const inside = list.some(x => t >= x.t0 && t <= mediaEnd(x));
+    toast(inside ? 'Слишком близко к краю клипа' : 'Поставь плейхед внутрь видео');
+    return;
+  }
+  pushHist();
+  const oldEnd = mediaEnd(m);
+  let cut;
+  if (side === 'head') {
+    cut = t - m.t0;
+    m.inPoint = Math.round(((m.inPoint || 0) + cut) * 100) / 100;
+    m.dur = Math.round((m.dur - cut) * 100) / 100;
+  } else {
+    cut = oldEnd - t;
+    m.dur = Math.round((t - m.t0) * 100) / 100;
+  }
+  for (const other of S.media) {
+    if (other !== m && other.t0 >= oldEnd - 1e-3) other.t0 = Math.round((other.t0 - cut) * 100) / 100;
+  }
+  S.selMedia = m.id;
+  S.selTrans = null;
+  updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
+  toast(side === 'head' ? 'Обрезано до плейхеда' : 'Обрезано после плейхеда');
+}
+
+/* Удаление с подтяжкой (ripple) — только видеодорожка: клипы правее места
+   удаления сдвигаются влево на длину убранного куска. Наезды и сцены не
+   трогаем — они, как оверлеи в CapCut, привязаны к времени ролика, а не
+   к соседнему клипу, и сдвигать их при монтаже видео было бы неожиданно. */
 function deleteMedia(id) {
   const i = S.media.findIndex(m => m.id === id);
   if (i < 0) return;
-  const name = S.media[i].name;
+  pushHist();
+  const m = S.media[i];
+  const name = m.name, end = mediaEnd(m), dur = m.dur;
   S.media.splice(i, 1);
-  const p = mediaPool[id];
-  if (p) {
-    try { p.video.pause(); p.video.removeAttribute('src'); p.video.load(); } catch (_) {}
-    if (p.url) URL.revokeObjectURL(p.url);
-    delete mediaPool[id];
+  for (const other of S.media) {
+    if (other.t0 >= end - 1e-3) other.t0 = Math.round((other.t0 - dur) * 100) / 100;
   }
+  S.trans = S.trans.filter(tr => tr.after !== id);
   if (S.selMedia === id) S.selMedia = null;
-  hasVideo = S.media.some(m => mediaPool[m.id]);
+  gcPool();
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   toast(`Видео убрано: ${name.length > 22 ? name.slice(0, 22) + '…' : name}`);
 }
@@ -2043,25 +2227,71 @@ function deleteMedia(id) {
 function clearVideo() {
   if (!S.media.length) { toast('Видео и так нет'); return; }
   setPlaying(false);
-  for (const m of S.media.slice()) deleteMedia(m.id);
+  hist.undo = []; hist.redo = [];   // не отменяется — история чистится вместе с пулом
+  updateHistButtons();
+  for (const id of Object.keys(mediaPool)) {
+    const p = mediaPool[id];
+    try {
+      p.video.pause();
+      if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
+      p.video.removeAttribute('src');
+      p.video.load();
+      if (p.url) URL.revokeObjectURL(p.url);
+    } catch (_) {}
+    delete mediaPool[id];
+  }
+  S.media = []; S.trans = [];
+  S.selMedia = null; S.selTrans = null;
+  hasVideo = false;
+  updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   seekTo(0);
+  toast('Все видео убраны');
 }
 
 function selectMedia(id) {
   S.selMedia = id;
+  S.selTrans = null;
   [...$('#trkVideo').querySelectorAll('.clip')].forEach(el => el.classList.toggle('sel', el.dataset.id === id));
+  [...$('#trkVideo').querySelectorAll('.tr')].forEach(el => el.classList.remove('sel'));
   updateVideoMeta(); save();
 }
 
 function updateVideoMeta() {
   const el = $('#videoMeta');
   $('#btnClearVideo').disabled = !S.media.length;
+
+  const tr = getTrans(S.selTrans);
+  if (tr) {
+    // Панель не перестраиваем на каждый 'input' — иначе ползунок пересоздаётся
+    // прямо под курсором во время протяжки. Обновляем только текст подписи.
+    el.innerHTML = `Переход · затемнение <span id="transDurLabel">${tr.dur.toFixed(1)}</span> с` +
+      `<div class="row" style="margin-top:6px"><input type="range" id="transDurRange" min="0.2" max="2" step="0.1" value="${tr.dur}"></div>` +
+      `<button class="ghost" id="btnTransDelete" style="margin-top:6px">Удалить переход</button>`;
+    const range = $('#transDurRange');
+    const label = $('#transDurLabel');
+    const preSnap = snap();   // состояние до перетаскивания ползунка — снимок сделаем один раз
+    range.addEventListener('input', () => { setTransDur(tr.id, +range.value); label.textContent = tr.dur.toFixed(1); });
+    range.addEventListener('change', () => {
+      if (snap() !== preSnap) pushHist(preSnap);
+      setTransDur(tr.id, +range.value);
+      label.textContent = tr.dur.toFixed(1);
+    });
+    $('#btnTransDelete').addEventListener('click', () => deleteTransition(tr.id));
+    return;
+  }
+
   if (!S.media.length) { el.textContent = 'Видео нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
   const cur = getMedia(S.selMedia) || sortedMedia()[0];
   const p = mediaPool[cur.id];
   el.innerHTML = `<b style="color:#c6ccdc">${cur.name}</b><br>` +
     (p ? `${p.w}×${p.h} · ` : '') + `${cur.t0.toFixed(1)}–${mediaEnd(cur).toFixed(1)} с` +
-    (S.media.length > 1 ? `<br><span style="color:#8b93a7">Всего роликов: ${S.media.length}, общая длина ${mediaDur().toFixed(1)} с</span>` : '');
+    (S.media.length > 1 ? `<br><span style="color:#8b93a7">Всего роликов: ${S.media.length}, общая длина ${mediaDur().toFixed(1)} с</span>` : '') +
+    `<div class="row" style="margin-top:8px;gap:6px">` +
+    `<button class="ghost" id="btnClipSplit" title="S — разделить по плейхеду">✂ Разделить по плейхеду</button>` +
+    `<button class="ghost" id="btnClipDelete">Удалить клип</button>` +
+    `</div>`;
+  $('#btnClipSplit').addEventListener('click', () => splitMediaAt());
+  $('#btnClipDelete').addEventListener('click', () => deleteMedia(cur.id));
 }
 
 $('#btnClearVideo').addEventListener('click', clearVideo);
@@ -2188,10 +2418,23 @@ window.addEventListener('keydown', e => {
   if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
   if (e.code === 'Escape' && selecting) { endSelect(); return; }
   if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
+  const mod = e.metaKey || e.ctrlKey;
+  if (mod && (e.key === 'z' || e.key === 'Z' || e.key === 'я')) {
+    e.preventDefault();
+    if (e.shiftKey) redo(); else undo();
+    return;
+  }
+  if (mod && (e.key === 'y' || e.key === 'Y' || e.key === 'н')) { e.preventDefault(); redo(); return; }
+  if (!mod && !e.altKey) {
+    if (e.key === 's' || e.key === 'ы') { e.preventDefault(); splitMediaAt(); return; }
+    if (e.key === 'q' || e.key === 'й') { e.preventDefault(); trimToPlayhead('head'); return; }
+    if (e.key === 'w' || e.key === 'ц') { e.preventDefault(); trimToPlayhead('tail'); return; }
+  }
   if (e.key === 'r' || e.key === 'к') resetPose();
   if (e.key === 'Delete' || e.key === 'Backspace') {
     if (S.sel) { e.preventDefault(); deleteClip(S.sel); }
     else if (S.selScene) { e.preventDefault(); deleteScene(S.selScene); }
+    else if (S.selTrans) { e.preventDefault(); deleteTransition(S.selTrans); }
     else if (S.selMedia) { e.preventDefault(); deleteMedia(S.selMedia); }
   }
 });
@@ -2212,6 +2455,25 @@ function xToT(clientX) {
 function xToTraw(clientX) {
   const r = trackEl().getBoundingClientRect();
   return ((clientX - r.left) / Math.max(1, r.width)) * tlDur();
+}
+
+/* Прилипание при перетаскивании: тянемся к плейхеду, к краям холста и к
+   границам чужих клипов на всех трёх дорожках — порог в 6 экранных px,
+   переведённых в секунды через текущую ширину дорожки.                    */
+function snapT(t, excludeId) {
+  const D = tlDur();
+  const w = trackEl().getBoundingClientRect().width || 1;
+  const thresh = 6 / w * D;
+  const cands = [clock, 0, D];
+  for (const m of S.media)  if (m.id !== excludeId) cands.push(m.t0, mediaEnd(m));
+  for (const c of S.clips)  if (c.id !== excludeId) cands.push(c.t0, clipEnd(c));
+  for (const b of S.scenes) if (b.id !== excludeId) cands.push(b.t0, sceneEnd(b));
+  let best = t, bestD = thresh;
+  for (const cand of cands) {
+    const d = Math.abs(cand - t);
+    if (d < bestD) { bestD = d; best = cand; }
+  }
+  return best;
 }
 
 function newClipId() { return 'z' + (clipSeq++); }
@@ -2238,6 +2500,7 @@ function freeSlot(at, want) {
 function addClip() {
   const slot = freeSlot(clock, 2.6);
   if (!slot) { toast('Здесь уже есть наезд — поставь плейхед в свободное место'); return; }
+  pushHist();
   const prev = S.clips[S.clips.length - 1];
   const c = {
     id: newClipId(), t0: slot.t0, dur: slot.dur, ramp: 0.9, fill: 0.82,
@@ -2253,6 +2516,7 @@ function addClip() {
 function deleteClip(id) {
   const i = S.clips.findIndex(c => c.id === id);
   if (i < 0) return;
+  pushHist();
   S.clips.splice(i, 1);
   if (S.sel === id) S.sel = null;
   if (selecting === id) endSelect();
@@ -2281,6 +2545,7 @@ function addScene(scId, at, want) {
   if (!sc.dur) return null;
   const slot = freeSceneSlot(at === undefined ? clock : at, want || sc.dur);
   if (!slot) { toast('Здесь уже стоит сцена — поставь плейхед в свободное место'); return null; }
+  pushHist();
   const b = { id: newSceneId(), sc: scId, t0: Math.round(slot.t0 * 100) / 100, dur: Math.round(slot.dur * 100) / 100 };
   S.scenes.push(b);
   S.selScene = b.id;
@@ -2290,6 +2555,7 @@ function addScene(scId, at, want) {
 
 /* Ролик: очищает дорожку и раскладывает сцены встык, начиная с нуля. */
 function applyReel(reel) {
+  pushHist();
   S.scenes.length = 0;
   let t = 0;
   for (const [scId, dur] of reel.seq) {
@@ -2306,6 +2572,7 @@ function applyReel(reel) {
 function deleteScene(id) {
   const i = S.scenes.findIndex(b => b.id === id);
   if (i < 0) return;
+  pushHist();
   S.scenes.splice(i, 1);
   if (S.selScene === id) S.selScene = null;
   renderTimeline(); save();
@@ -2326,6 +2593,60 @@ function selectClip(id) {
   save();
 }
 
+/* ---------------------------------------------------------- переходы --- */
+
+function selectTrans(id) {
+  S.selTrans = id;
+  S.selMedia = null;
+  [...$('#trkVideo').querySelectorAll('.clip')].forEach(el => el.classList.remove('sel'));
+  [...$('#trkVideo').querySelectorAll('.tr')].forEach(el => el.classList.toggle('sel', el.dataset.id === id));
+  updateVideoMeta();
+  save();
+}
+
+function addTransition(afterId, dur = 0.5) {
+  const exists = transAfter(afterId);
+  if (exists) { selectTrans(exists.id); return; }
+  if (!getMedia(afterId)) return;
+  pushHist();
+  const tr = { id: newTransId(), after: afterId, dur };
+  S.trans.push(tr);
+  S.selTrans = tr.id;
+  S.selMedia = null;
+  renderTimeline(); updateVideoMeta(); save();
+  toast('Переход добавлен');
+}
+
+function deleteTransition(id) {
+  const i = S.trans.findIndex(t => t.id === id);
+  if (i < 0) return;
+  pushHist();
+  S.trans.splice(i, 1);
+  if (S.selTrans === id) S.selTrans = null;
+  renderTimeline(); updateVideoMeta(); save();
+  toast('Переход удалён');
+}
+
+/* Длительность крестфейда не может быть больше самого короткого из двух
+   склеиваемых клипов — иначе затемнение съест больше, чем в них есть.     */
+function setTransDur(id, dur) {
+  const tr = getTrans(id);
+  if (!tr) return;
+  let maxDur = 2.0;
+  const left = getMedia(tr.after);
+  if (left) maxDur = Math.min(maxDur, left.dur);
+  const list = sortedMedia();
+  const li = list.findIndex(x => x.id === tr.after);
+  const right = li >= 0 ? list[li + 1] : null;
+  if (right) maxDur = Math.min(maxDur, right.dur);
+  tr.dur = Math.round(clamp(dur, 0.2, Math.max(0.2, maxDur)) * 100) / 100;
+  // Панель #videoMeta тут намеренно не перестраиваем: это дёргает ползунок
+  // прямо во время протяжки (input срабатывает на каждый шаг) — обновляем
+  // только маркер на дорожке и подпись значения, см. вызов в updateVideoMeta.
+  layoutJunctions();
+  save();
+}
+
 /* --- перетаскивание и растягивание --- */
 let clipDrag = null;
 
@@ -2335,7 +2656,14 @@ function onClipDown(e, id, mode) {
   const c = dragTarget(id);
   if (!c) return;
   if (isSceneId(id)) selectScene(id); else if (isMediaId(id)) selectMedia(id); else selectClip(id);
-  clipDrag = { id, mode, t: xToTraw(e.clientX), t0: c.t0, dur: c.dur, inPoint: c.inPoint || 0 };
+  clipDrag = { id, mode, t: xToTraw(e.clientX), t0: c.t0, dur: c.dur, inPoint: c.inPoint || 0, snap: snap() };
+  // При обрезке видео замораживаем плёнку в исходных px — иначе кадры растягиваются
+  // вместе с div, а должны обрезаться (см. D.4 в брифе).
+  if (isMediaId(id) && mode !== 'move') {
+    const clipEl = e.target.closest('.clip');
+    const th = clipEl ? clipEl.querySelector('canvas.thumbs') : null;
+    if (th) { clipDrag.thumbsEl = th; clipDrag.thumbsW = th.getBoundingClientRect().width; }
+  }
   try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
 }
 
@@ -2350,13 +2678,26 @@ window.addEventListener('pointermove', e => {
   const loBound = Math.max(0, ...others.filter(x => clipEnd(x) <= clipDrag.t0 + 1e-6).map(clipEnd), 0);
   const hiCand = others.filter(x => x.t0 >= clipDrag.t0 + clipDrag.dur - 1e-6).map(x => x.t0);
   const hiBound = hiCand.length ? Math.min(D, ...hiCand) : D;
+  const snapOn = !e.altKey;
 
   if (clipDrag.mode === 'move') {
-    c.t0 = clamp(clipDrag.t0 + d, loBound, hiBound - c.dur);
+    const rawT0 = clipDrag.t0 + d;
+    let newT0 = rawT0;
+    if (snapOn) {
+      const s0 = snapT(rawT0, c.id);
+      if (s0 !== rawT0) newT0 = s0;
+      else {
+        const rawEnd = rawT0 + clipDrag.dur;
+        const sEnd = snapT(rawEnd, c.id);
+        if (sEnd !== rawEnd) newT0 = sEnd - clipDrag.dur;
+      }
+    }
+    c.t0 = clamp(newT0, loBound, hiBound - c.dur);
   } else if (clipDrag.mode === 'l') {
     const end = clipDrag.t0 + clipDrag.dur;
-    const before = c.t0;
-    c.t0 = clamp(clipDrag.t0 + d, loBound, end - 0.3);
+    const rawT0 = clipDrag.t0 + d;
+    const newT0 = snapOn ? snapT(rawT0, c.id) : rawT0;
+    c.t0 = clamp(newT0, loBound, end - 0.3);
     c.dur = end - c.t0;
     if (isMediaId(clipDrag.id)) {                 // тянем начало = двигаем точку входа
       const p = mediaPool[c.id];
@@ -2364,7 +2705,9 @@ window.addEventListener('pointermove', e => {
       c.inPoint = clamp(inp, 0, p ? Math.max(0, p.natDur - 0.3) : 0);
     }
   } else {
-    c.dur = clamp(clipDrag.dur + d, 0.3, hiBound - c.t0);
+    const rawEnd = clipDrag.t0 + clipDrag.dur + d;
+    const newEnd = snapOn ? snapT(rawEnd, c.id) : rawEnd;
+    c.dur = clamp(newEnd - c.t0, 0.3, hiBound - c.t0);
   }
   c.t0 = Math.round(c.t0 * 100) / 100;
   c.dur = Math.round(c.dur * 100) / 100;
@@ -2373,13 +2716,30 @@ window.addEventListener('pointermove', e => {
     // обрезка справа не должна выйти за исходную длину файла
     const p = mediaPool[c.id];
     if (p) c.dur = Math.min(c.dur, p.natDur - (c.inPoint || 0));
-    layoutMedia(c); updateVideoMeta();
+    layoutMedia(c); updateVideoMeta(); layoutJunctions();
+    if (clipDrag.thumbsEl) {
+      clipDrag.thumbsEl.style.width = clipDrag.thumbsW + 'px';
+      if (clipDrag.mode === 'l') {
+        const w = trackEl().getBoundingClientRect().width || 1;
+        const deltaPx = (c.t0 - clipDrag.t0) / D * w;
+        clipDrag.thumbsEl.style.left = (-deltaPx) + 'px';
+      }
+    }
   }
   else { layoutClip(c); updateFocusMeta(); }
 });
 
 window.addEventListener('pointerup', () => {
-  if (clipDrag) { clipDrag = null; renderTimeline(); save(); }
+  if (clipDrag) {
+    const wasMedia = isMediaId(clipDrag.id);
+    const c = wasMedia ? getMedia(clipDrag.id) : null;
+    const changed = !!c && (c.inPoint !== clipDrag.inPoint || c.dur !== clipDrag.dur);
+    if (snap() !== clipDrag.snap) pushHist(clipDrag.snap);
+    clipDrag = null;
+    renderTimeline();
+    if (wasMedia && changed) scheduleStrip();
+    save();
+  }
 });
 
 /* --- скраб по дорожкам --- */
@@ -2388,7 +2748,7 @@ function scrubFrom(e) { seekTo(xToT(e.clientX)); }
 for (const id of ['#tlruler', '#trkVideo', '#trkScene', '#trkZoom']) {
   const el = $(id);
   el.addEventListener('pointerdown', e => {
-    if (e.target.closest('.clip')) return;
+    if (e.target.closest('.clip, .jn, .tr')) return;
     scrubbing = true; scrubFrom(e);
     try { el.setPointerCapture(e.pointerId); } catch (_) {}
     if (id === '#trkZoom') selectClip(null);
@@ -2435,6 +2795,32 @@ function layoutClip(c) {
   el.querySelector('b').textContent = `Наезд ${c.dur.toFixed(1)} с`;
 }
 
+/* Позиции «+»-кнопок и маркеров переходов — отдельно от renderTimeline(),
+   чтобы во время перетаскивания клипа они ехали вместе с ним без пересборки
+   всей дорожки (см. C.3 в брифе).                                        */
+function layoutJunctions() {
+  const D = tlDur();
+  const trkV = $('#trkVideo');
+  const rectW = trkV.getBoundingClientRect().width || 1;
+  for (const jn of [...trkV.querySelectorAll('.jn')]) {
+    const a = getMedia(jn.dataset.after);
+    if (!a) { jn.remove(); continue; }
+    jn.style.left = tToPct(mediaEnd(a)) + '%';
+  }
+  for (const el of [...trkV.querySelectorAll('.tr')]) {
+    const tr = getTrans(el.dataset.id);
+    if (!tr) { el.remove(); continue; }
+    const a = getMedia(tr.after);
+    const center = a ? mediaEnd(a) : 0;
+    const wPx = Math.max(26, (tr.dur / D) * rectW);
+    el.style.left = tToPct(center) + '%';
+    el.style.width = wPx + 'px';
+    el.classList.toggle('sel', tr.id === S.selTrans);
+    const lbl = el.querySelector('.x');
+    if (lbl) lbl.textContent = `◆ ${tr.dur.toFixed(1)}с`;
+  }
+}
+
 function renderTimeline() {
   const D = tlDur();
 
@@ -2465,21 +2851,60 @@ function renderTimeline() {
     layoutScene(b);
   }
 
-  // видео — клипы на своей дорожке
+  // видео — клипы на своей дорожке, у каждого своя плёнка кадров
   const trkV = $('#trkVideo');
-  [...trkV.querySelectorAll('.clip')].forEach(el => el.remove());
+  [...trkV.querySelectorAll('.clip, .jn, .tr')].forEach(el => el.remove());
+  let needStrip = false;
   for (const m of S.media) {
     const el = document.createElement('div');
     el.className = 'clip media' + (m.id === S.selMedia ? ' sel' : '');
     el.dataset.id = m.id;
-    el.innerHTML = '<b></b><div class="h l"></div><div class="h r"></div><div class="x">×</div>';
+    el.innerHTML = '<canvas class="thumbs"></canvas><b></b><div class="h l"></div><div class="h r"></div><div class="x">×</div>';
     el.addEventListener('pointerdown', e => onClipDown(e, m.id, 'move'));
     el.querySelector('.h.l').addEventListener('pointerdown', e => onClipDown(e, m.id, 'l'));
     el.querySelector('.h.r').addEventListener('pointerdown', e => onClipDown(e, m.id, 'r'));
     el.querySelector('.x').addEventListener('pointerdown', e => { e.stopPropagation(); deleteMedia(m.id); });
     trkV.appendChild(el);
     layoutMedia(m);
+    // если под текущий размер/обрезку уже есть готовая плёнка — рисуем сразу,
+    // без ожидания buildFilmstrip (см. D.3 в брифе)
+    const cached = thumbCache[m.id];
+    const w = Math.max(8, el.clientWidth);
+    if (cached && cached.key === thumbKey(m, w)) {
+      const th = el.querySelector('canvas.thumbs');
+      th.width = cached.canvas.width; th.height = cached.canvas.height;
+      th.getContext('2d').drawImage(cached.canvas, 0, 0);
+    } else needStrip = true;
   }
+
+  // стыки между соседними по времени клипами: «+» там, где перехода ещё нет,
+  // маркер — там, где уже есть (переход рисуется, даже если клип успел
+  // отъехать и стык распался — это просто уход в чёрное на его конце)
+  const sm = sortedMedia();
+  for (let i = 0; i < sm.length - 1; i++) {
+    const a = sm[i], b = sm[i + 1];
+    if (Math.abs(b.t0 - mediaEnd(a)) >= 0.05) continue;
+    if (transAfter(a.id)) continue;
+    const jn = document.createElement('div');
+    jn.className = 'jn';
+    jn.dataset.after = a.id;
+    jn.textContent = '+';
+    jn.title = 'Добавить переход (затемнение)';
+    jn.addEventListener('pointerdown', e => e.stopPropagation());
+    jn.addEventListener('click', e => { e.stopPropagation(); addTransition(a.id); });
+    trkV.appendChild(jn);
+  }
+  for (const tr of S.trans) {
+    const el = document.createElement('div');
+    el.className = 'tr' + (tr.id === S.selTrans ? ' sel' : '');
+    el.dataset.id = tr.id;
+    el.title = 'Переход · затемнение';
+    el.innerHTML = `<div class="x">◆ ${tr.dur.toFixed(1)}с</div>`;
+    el.addEventListener('pointerdown', e => { e.stopPropagation(); selectTrans(tr.id); });
+    trkV.appendChild(el);
+  }
+  layoutJunctions();
+  if (needStrip) scheduleStrip();
 
   // конец видео
   const md = mediaDur();
@@ -2506,45 +2931,74 @@ function renderTimeline() {
   $('#tDur').textContent = D.toFixed(1);
 }
 
+/* Кэш булева «есть клип под плейхедом» — чтобы не трогать disabled на DOM
+   каждый кадр (updatePlayhead вызывается из frame() безусловно).          */
+let editBtnsEnabled = null;
 function updatePlayhead() {
   const wrap = $('#tlwrap');
   const trk = trackEl();
   const r = trk.getBoundingClientRect(), w = wrap.getBoundingClientRect();
   $('#playhead').style.left = (r.left - w.left + (clock / tlDur()) * r.width) + 'px';
   $('#tCur').textContent = clock.toFixed(1);
+
+  const enabled = !!clipUnderPlayhead();
+  if (enabled !== editBtnsEnabled) {
+    editBtnsEnabled = enabled;
+    $('#btnSplit').disabled = !enabled;
+    $('#btnTrimL').disabled = !enabled;
+    $('#btnTrimR').disabled = !enabled;
+  }
 }
 
-/* --- киноплёнка: кадры тянем ВТОРЫМ video, чтобы не дёргать основной --- */
+/* --- киноплёнка: кадры тянем ВТОРЫМ video, чтобы не дёргать основной ---
+   У каждого клипа теперь свой <canvas class="thumbs"> внутри его же .clip
+   (см. renderTimeline) — единой дорожечной полосы больше нет, поэтому кадры
+   едут и обрезаются вместе с клипом сами, без ручной синхронизации.       */
+const thumbCache = {};   // id клипа → {key, canvas}: canvas — офскрин-снимок последней отрисовки
+function thumbKey(m, w) { return `${(m.inPoint || 0).toFixed(2)}|${m.dur.toFixed(2)}|${w}`; }
+
 let stripToken = 0;
 async function buildFilmstrip() {
   const token = ++stripToken;
-  const cv = $('#strip');
-  const g = cv.getContext('2d');
-  const rect = cv.getBoundingClientRect();
-  cv.width = Math.max(120, Math.round(rect.width * 2));
-  cv.height = Math.max(40, Math.round(rect.height * 2));
-  g.clearRect(0, 0, cv.width, cv.height);
   if (!S.media.length) return;
 
-  const D = tlDur();
-  for (const m of sortedMedia()) {
-    if (token !== stripToken) return;
-    const p = mediaPool[m.id];
-    if (!p) continue;
-    // окно клипа в пикселях холста полосы
-    const x0 = Math.round(m.t0 / D * cv.width), x1 = Math.round(mediaEnd(m) / D * cv.width);
-    const cw = Math.max(4, x1 - x0);
-    let thumbW = Math.round(cv.height * (p.w / Math.max(1, p.h)));
-    thumbW = Math.max(thumbW, Math.ceil(cw / 12));
-    const n = clamp(Math.ceil(cw / Math.max(8, thumbW)), 1, 16);
-
+  // Один второй-<video> на уникальный источник — после split у клипов их
+  // может быть несколько с одним и тем же src, гонять по видео заново не надо.
+  const fvCache = new Map();
+  async function getFv(src) {
+    if (fvCache.has(src)) return fvCache.get(src);
     const fv = document.createElement('video');
-    fv.muted = true; fv.playsInline = true; fv.preload = 'auto'; fv.src = p.video.currentSrc || p.video.src;
+    fv.muted = true; fv.playsInline = true; fv.preload = 'auto'; fv.src = src;
     try { await new Promise((res, rej) => { fv.onloadeddata = res; fv.onerror = rej; setTimeout(rej, 8000); }); }
-    catch (_) { continue; }
+    catch (_) { return null; }
+    fvCache.set(src, fv);
+    return fv;
+  }
+
+  for (const m of sortedMedia()) {
+    if (token !== stripToken) break;
+    const p = mediaPool[m.id];
+    const el = $(`#trkVideo .clip.media[data-id="${m.id}"] canvas.thumbs`);
+    if (!p || !el) continue;
+
+    const w = Math.max(8, el.clientWidth), h = Math.max(8, el.clientHeight);
+    const key = thumbKey(m, w);
+    if (thumbCache[m.id] && thumbCache[m.id].key === key) continue;   // уже нарисовано под этот размер/обрезку
+
+    el.width = w * 2; el.height = h * 2;
+    const g = el.getContext('2d');
+    g.clearRect(0, 0, el.width, el.height);
+
+    const src = p.video.currentSrc || p.video.src;
+    const fv = await getFv(src);
+    if (!fv || token !== stripToken) continue;
+
+    let thumbW = Math.round(el.height * (p.w / Math.max(1, p.h)));
+    thumbW = Math.max(thumbW, Math.ceil(el.width / 12));
+    const n = clamp(Math.ceil(el.width / Math.max(8, thumbW)), 1, 16);
 
     for (let i = 0; i < n; i++) {
-      if (token !== stripToken) { try { fv.src = ''; } catch (_) {} return; }
+      if (token !== stripToken) break;
       const t = (m.inPoint || 0) + (i + 0.5) / n * m.dur;
       try {
         await new Promise(res => {
@@ -2558,16 +3012,16 @@ async function buildFilmstrip() {
           fv.currentTime = clamp(t, 0, Math.max(0, p.natDur - 0.03));
           setTimeout(ok, 900);
         });
-        g.drawImage(fv, x0 + i * (cw / n), 0, cw / n + 1, cv.height);
+        g.drawImage(fv, i * (el.width / n), 0, el.width / n + 1, el.height);
       } catch (_) { continue; }
       await new Promise(r => setTimeout(r, 0));
     }
-    try { fv.src = ''; } catch (_) {}
+    // клип мог исчезнуть/перестроиться, пока мы ждали кадры — тогда просто не кэшируем
+    if (token === stripToken && $(`#trkVideo .clip.media[data-id="${m.id}"] canvas.thumbs`) === el) {
+      thumbCache[m.id] = { key, canvas: el };
+    }
   }
-  if (token === stripToken) {
-    g.fillStyle = 'rgba(8,10,16,.45)';
-    g.fillRect(0, 0, cv.width, cv.height);
-  }
+  for (const fv of fvCache.values()) { try { fv.src = ''; } catch (_) {} }
 }
 
 /* ================================================= главный цикл ========= */
@@ -3031,6 +3485,11 @@ function buildUI() {
   $('#btnSelect').addEventListener('click', () => selecting ? endSelect() : startSelect(S.sel));
   $('#fcDelete').addEventListener('click', () => S.sel && deleteClip(S.sel));
   $('#btnAddZoom').addEventListener('click', addClip);
+  $('#btnSplit').addEventListener('click', () => splitMediaAt());
+  $('#btnTrimL').addEventListener('click', () => trimToPlayhead('head'));
+  $('#btnTrimR').addEventListener('click', () => trimToPlayhead('tail'));
+  $('#btnUndo').addEventListener('click', undo);
+  $('#btnRedo').addEventListener('click', redo);
   const syncLoop = () => {
     $('#btnLoop').classList.toggle('on', !!S.loop);
     $('#btnLoop').title = S.loop ? 'Повтор включён' : 'Повтор выключен — в конце остановится';
@@ -3101,6 +3560,7 @@ function load() {
     if (DEVICES[S.device] && !deviceColors(DEVICES[S.device]).includes(S.frame)) S.frame = deviceColors(DEVICES[S.device])[0];
     if (S.bg.type === 'image') S.bg.type = 'linear';   // картинку заново не восстановить
     S.media = [];  S.selMedia = null;      // blob-ссылки не переживают перезагрузку
+    S.trans = []; S.selTrans = null;       // переходы висят на медиа-клипах, тоже не переживают
     if (!Array.isArray(S.scenes)) S.scenes = [];
     S.scenes = S.scenes.filter(b => b && SCENARIOS.some(x => x.id === b.sc && x.dur > 0) && isFinite(b.t0) && b.dur > 0);
     for (const b of S.scenes) {
@@ -3130,6 +3590,7 @@ function init() {
   updateFocusMeta();
   updateVideoMeta();
   renderTimeline();
+  updateHistButtons();
 
   const q = new URLSearchParams(location.search);
   if (q.get('video')) loadVideoUrl(q.get('video'));
@@ -3147,4 +3608,7 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
   get last(){ return lastRender }, get selecting(){ return selecting }, startSelect, endSelect,
   setPose: p => { Object.assign(S.pose, p); syncPoseUI(); },
-  setPlaying: v => setPlaying(v) };
+  setPlaying: v => setPlaying(v),
+  splitMediaAt, trimToPlayhead, addTransition, deleteTransition, setTransDur, transFade, selectTrans,
+  undo, redo, hist, gcPool, snapT, thumbCache, layoutJunctions,
+  get clock() { return clock } };

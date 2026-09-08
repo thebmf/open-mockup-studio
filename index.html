@@ -233,15 +233,20 @@
         <button id="btnPlay" class="tbtn" title="Пробел">▶</button>
         <button id="btnStart" class="tbtn" title="В начало">⏮</button>
         <button id="btnLoop" class="tbtn" title="Повтор по кругу">↻</button>
+        <button id="btnUndo" class="tbtn" title="Отменить — ⌘Z" disabled>↶</button>
+        <button id="btnRedo" class="tbtn" title="Повторить — ⌘⇧Z" disabled>↷</button>
         <div class="tc"><span id="tCur">0.0</span> / <span id="tDur">0.0</span> с</div>
         <button id="btnAddZoom" class="tbtn wide">+ Наезд</button>
+        <button id="btnSplit" class="tbtn wide" title="S — разделить по плейхеду" disabled>✂ Разделить</button>
+        <button id="btnTrimL" class="tbtn wide" title="Q" disabled>⇤ Отрезать до</button>
+        <button id="btnTrimR" class="tbtn wide" title="W" disabled>Отрезать после ⇥</button>
         <div class="spacer"></div>
         <div class="tc" id="dims">1080×1920</div>
         <button id="btnRecord2" class="tbtn recbtn">● Записать</button>
       </div>
       <div id="tlwrap">
         <div id="tlruler"></div>
-        <div class="trk" id="trkVideo"><canvas id="strip"></canvas><i class="trklabel">видео</i><div id="vEnd" hidden></div></div>
+        <div class="trk" id="trkVideo"><i class="trklabel">видео</i><div id="vEnd" hidden></div></div>
         <div class="trk" id="trkZoom"><i class="trklabel">наезды</i></div>
         <div class="trk" id="trkScene"><i class="trklabel">сценарий</i></div>
         <div id="playhead"></div>
