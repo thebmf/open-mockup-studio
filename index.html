@@ -282,6 +282,16 @@
 
 <div id="toast"></div>
 
+<!-- Всплывающая панель длительности перехода — над выбранным маркером .tr
+     на дорожке (см. раздел B в брифе); position:fixed, координаты считает
+     layoutTrPop() в app.js. -->
+<div id="trPop" hidden>
+  <span>Затемнение</span>
+  <input type="range" id="trPopRange" min="0.1" max="3" step="0.05" value="0.5">
+  <b id="trPopVal">0.5 с</b>
+  <button class="ghost" id="trPopDel">Удалить</button>
+</div>
+
 <video id="v" playsinline muted loop crossorigin="anonymous"></video>
 
 <script src="app.js"></script>

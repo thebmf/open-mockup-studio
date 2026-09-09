@@ -1926,8 +1926,18 @@ function updateFocusMeta() {
   $('#fcFill').disabled = !has || isScale;
   ['fcK', 'fcAX', 'fcAY'].forEach(id => { $('#' + id).disabled = !has || !isScale; });
   $('#fcRamp').disabled = !has;
-  $('#btnSelect').disabled = !has || isScale;
-  $('#btnSelect').hidden = isScale;
+  // Пока идёт обводка участка (selecting), кнопка её отмены должна быть
+  // видима и активна независимо от того, какой клип сейчас выбран в
+  // таймлайне — иначе клик по масштабу под рукой прятал единственный
+  // способ выйти из режима обводки, кроме Escape (см. E.3 в брифе).
+  if (selecting) {
+    $('#btnSelect').hidden = false;
+    $('#btnSelect').disabled = false;
+    $('#btnSelect').textContent = 'Отменить выделение';
+  } else {
+    $('#btnSelect').disabled = !has || isScale;
+    $('#btnSelect').hidden = isScale;
+  }
   $('#fcFillRow').hidden = isScale;
   ['fcKRow', 'fcAXRow', 'fcAYRow'].forEach(id => { $('#' + id).hidden = !isScale; });
   $('#fcDelete').disabled = !has;
@@ -2382,6 +2392,7 @@ function clearVideo() {
 function selectMedia(id) {
   S.selMedia = id;
   S.selTrans = null;
+  trPopPreSnap = null;   // снимаем выбор перехода в обход selectTrans() — снимок протяжки #trPopRange тоже надо сбросить (см. находку)
   [...$('#trkVideo').querySelectorAll('.clip')].forEach(el => el.classList.toggle('sel', el.dataset.id === id));
   [...$('#trkVideo').querySelectorAll('.tr')].forEach(el => el.classList.remove('sel'));
   updateVideoMeta(); save();
@@ -2397,26 +2408,106 @@ function transKindLabel(tr) {
   return 'в начале';
 }
 
+/* Ползунок, чьё СОБСТВЕННОЕ событие 'input' сейчас обрабатывается — тот
+   выставляет этот флаг на себя перед вызовом syncTransDurUI() и снимает
+   сразу после (см. оба addEventListener('input', ...) ниже). Раньше вместо
+   этого проверяли document.activeElement !== range, но фокус — не то же
+   самое, что «активная протяжка именно сейчас»: после программного undo()
+   фокус мог остаться на #trPopRange, хотя никакого 'input' от него не
+   было, и проверка ошибочно пропускала запись настоящего значения —
+   ползунок расходился с подписью (см. находку). */
+let syncingRangeSelf = null;
+
+/* Короткая форма длительности перехода — «0.5», «1.05», «3»: без хвостовых
+   нулей и без точки, если дробной части не осталось (см. B в брифе). Шаг
+   ползунков — 0.05, поэтому двух знаков после запятой достаточно с запасом. */
+function fmtDur(v) { return (+v).toFixed(2).replace(/\.?0+$/, ''); }
+
+/* Единая точка, которая обновляет ВСЁ, что показывает tr.dur, кроме самого
+   маркера на дорожке (тот уже обновлён внутри setTransDur → layoutJunctions):
+   подпись и ползунок в левой панели (если панель сейчас в режиме перехода) и
+   во всплывающей панели над маркером (#trPop) — чтобы протяжка ручки,
+   клавиши ,/. и любой из двух ползунков не расходились между собой. Ползунок,
+   который сейчас реально тянет пользователь (syncingRangeSelf), не трогаем —
+   иначе `input` от setTransDur() дёргал бы его же собственный ползунок под курсором.*/
+function syncTransDurUI(tr) {
+  const label = $('#transDurLabel');
+  if (label) label.textContent = fmtDur(tr.dur);
+  const range = $('#transDurRange');
+  if (range && range !== syncingRangeSelf) range.value = tr.dur;
+  const popVal = $('#trPopVal');
+  if (popVal) popVal.textContent = fmtDur(tr.dur) + ' с';
+  const popRange = $('#trPopRange');
+  if (popRange && popRange !== syncingRangeSelf) popRange.value = tr.dur;
+}
+
+/* Снимок истории для протяжки #trPopRange — на уровне модуля, а не внутри
+   buildUI(), потому что сбрасывать его должен ещё и selectTrans() при любой
+   смене/снятии выбора перехода. Без этого прерванная без 'change' протяжка
+   (потеря фокуса, Escape) оставляла тут снимок с самого начала протяжки, и
+   следующая ЗАВЕРШЁННАЯ протяжка того же (или другого) перехода клала в
+   историю этот устаревший снимок вместо своего собственного — один undo
+   откатывал сразу несколько правок (см. находку).                        */
+let trPopPreSnap = null;
+
+/* Всплывающая панель длительности перехода прямо над маркером (см. B в
+   брифе) — левую панель со ползунком «1 · Видео» надо сначала найти и
+   прокрутить до неё, а маркер обычно уже перед глазами. Внутрь самой
+   дорожки её не поместить: у .trk overflow:hidden, у #tlwrap —
+   overflow-x:auto, поэтому #trPop — fixed-элемент в body, а не потомок
+   маркера, и координаты считаются заново при каждом вызове.
+   Дёргается из layoutJunctions (маркер сдвинулся — драг/зум/скролл клипов)
+   и updateVideoMeta (сменился выбор — undo/redo/deleteTransition/clearVideo
+   тоже проходят через неё), плюс из scroll/resize таймлайна отдельно. */
+function layoutTrPop() {
+  const pop = $('#trPop');
+  const tr = getTrans(S.selTrans);
+  const marker = tr ? $('#trkVideo .tr.sel') : null;
+  const wrap = $('#tlwrap');
+  let visible = false, rect = null;
+  if (tr && marker && marker.dataset.id === tr.id) {
+    rect = marker.getBoundingClientRect();
+    const wr = wrap.getBoundingClientRect();
+    visible = rect.width > 0 && rect.right > wr.left && rect.left < wr.right;
+  }
+  if (!visible) { pop.hidden = true; return; }
+  pop.hidden = false;
+  syncTransDurUI(tr);
+  const pw = pop.offsetWidth, ph = pop.offsetHeight;
+  const left = clamp(rect.left + rect.width / 2 - pw / 2, 8, innerWidth - pw - 8);
+  let top = rect.top - ph - 8, flip = false;
+  if (top < 4) { top = rect.bottom + 8; flip = true; }
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+  pop.classList.toggle('flip', flip);
+}
+
 function updateVideoMeta() {
   const el = $('#videoMeta');
   $('#btnClearVideo').disabled = !S.media.length;
   $('#btnTrans').disabled = !S.media.length;
 
   const tr = getTrans(S.selTrans);
+  layoutTrPop();
   if (tr) {
     // Панель не перестраиваем на каждый 'input' — иначе ползунок пересоздаётся
     // прямо под курсором во время протяжки. Обновляем только текст подписи.
-    el.innerHTML = `Переход · ${transKindLabel(tr)} · <span id="transDurLabel">${tr.dur.toFixed(1)}</span> с` +
-      `<div class="row" style="margin-top:6px"><input type="range" id="transDurRange" min="0.2" max="2" step="0.1" value="${tr.dur}"></div>` +
+    el.innerHTML = `Переход · ${transKindLabel(tr)} · <span id="transDurLabel">${fmtDur(tr.dur)}</span> с` +
+      `<div class="row" style="margin-top:6px"><input type="range" id="transDurRange" min="0.1" max="3" step="0.05" value="${tr.dur}"></div>` +
       `<button class="ghost" id="btnTransDelete" style="margin-top:6px">Удалить переход</button>`;
     const range = $('#transDurRange');
     const label = $('#transDurLabel');
     const preSnap = snap();   // состояние до перетаскивания ползунка — снимок сделаем один раз
-    range.addEventListener('input', () => { setTransDur(tr.id, +range.value); label.textContent = tr.dur.toFixed(1); });
+    range.addEventListener('input', () => {
+      syncingRangeSelf = range;
+      setTransDur(tr.id, +range.value); label.textContent = fmtDur(tr.dur); syncTransDurUI(tr);
+      syncingRangeSelf = null;
+    });
     range.addEventListener('change', () => {
       if (snap() !== preSnap) pushHist(preSnap);
       setTransDur(tr.id, +range.value);
-      label.textContent = tr.dur.toFixed(1);
+      label.textContent = fmtDur(tr.dur);
+      syncTransDurUI(tr);
     });
     $('#btnTransDelete').addEventListener('click', () => deleteTransition(tr.id));
     return;
@@ -2562,6 +2653,9 @@ window.addEventListener('keydown', e => {
   const tag = (e.target.tagName || '').toLowerCase();
   if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
   if (e.code === 'Escape' && selecting) { endSelect(); return; }
+  // Приоритет у обводки участка (проверка выше); Escape для перехода — только
+  // когда обводки нет (см. B.4 в брифе).
+  if (e.code === 'Escape' && S.selTrans) { e.preventDefault(); selectTrans(null); return; }
   if (e.code === 'Space') { e.preventDefault(); setPlaying(!playing); }
   const mod = e.metaKey || e.ctrlKey;
   if (mod && (e.key === 'z' || e.key === 'Z' || e.key === 'я')) {
@@ -2578,6 +2672,33 @@ window.addEventListener('keydown', e => {
     if (e.key === '-' || e.key === '_') { e.preventDefault(); setZoom(S.tl.pps / 1.25, clock); return; }
     if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoom(S.tl.pps * 1.25, clock); return; }
     if (e.key === '0') { e.preventDefault(); fitZoom(); return; }
+    // Длительность выбранного перехода: , / б — короче, . / ю — длиннее
+    // (см. D в брифе); каждое нажатие — свой шаг истории. Снимок берём ДО
+    // setTransDur и кладём в историю только если что-то реально изменилось
+    // (тот же приём, что у ползунков, snap()!==preSnap) — иначе повтор на
+    // границе клампа (0.1 или maxTransDur) плодил пустые шаги в hist.undo.
+    if (S.selTrans && (e.key === ',' || e.key === 'б')) {
+      const tr = getTrans(S.selTrans);
+      if (tr) {
+        e.preventDefault();
+        const s = snap();
+        setTransDur(tr.id, tr.dur - 0.1);
+        if (snap() !== s) pushHist(s);
+        syncTransDurUI(tr);
+      }
+      return;
+    }
+    if (S.selTrans && (e.key === '.' || e.key === 'ю')) {
+      const tr = getTrans(S.selTrans);
+      if (tr) {
+        e.preventDefault();
+        const s = snap();
+        setTransDur(tr.id, tr.dur + 0.1);
+        if (snap() !== s) pushHist(s);
+        syncTransDurUI(tr);
+      }
+      return;
+    }
   }
   if (e.key === 'r' || e.key === 'к') resetPose();
   if (e.key === 'Delete' || e.key === 'Backspace') {
@@ -2723,11 +2844,21 @@ function syncGutter() {
   gutter.style.left = wrap.offsetLeft + 'px';
   gutter.style.top = wrap.offsetTop + 'px';
   const wrapRect = wrap.getBoundingClientRect();
+  // #tlgutter в CSS без своей высоты — все дети position:absolute, в
+  // авто-высоту родителя не идут, и без явного height ниже она схлопнулась
+  // бы в 0: тогда bottom у лейблов мерил бы от той же точки, что и top
+  // (низ нулевой рамки совпадает с её верхом), и лейблы легли бы на верх
+  // дорожки, а не на низ (см. A.5 в брифе).
+  gutter.style.height = wrapRect.height + 'px';
   for (const lbl of gutter.querySelectorAll('.trklabel')) {
     const trk = document.getElementById(lbl.dataset.for);
     if (!trk) continue;
     const r = trk.getBoundingClientRect();
-    lbl.style.top = (r.top - wrapRect.top + 4) + 'px';
+    // Раньше подпись сидела у верхнего края дорожки (top:4px) — в узкой
+    // видеодорожке она заезжала в полоску переходов (см. A.5 в брифе).
+    // Теперь bottom:4px от нижнего края дорожки: #vEnd не трогаем — его
+    // подпись («конец видео») своя, живёт внутри #trkVideo (см. style.css).
+    lbl.style.bottom = (wrapRect.bottom - r.bottom + 4) + 'px';
   }
 }
 
@@ -2801,7 +2932,7 @@ function freeSlot(at, want) {
 
 function addClip() {
   const slot = freeSlot(clock, 2.6);
-  if (!slot) { toast('Здесь уже есть наезд — поставь плейхед в свободное место'); return; }
+  if (!slot) { toast('Здесь уже стоит другой блок — поставь плейхед в свободное место'); return; }
   pushHist();
   const prev = S.clips[S.clips.length - 1];
   // Предыдущий клип мог оказаться масштабом — у него нет u0..v1, поэтому
@@ -2822,7 +2953,7 @@ function addClip() {
    телефон целиком плавно увеличивается и уменьшается обратно (см. draw()). */
 function addScaleClip() {
   const slot = freeSlot(clock, 2.6);
-  if (!slot) { toast('Здесь уже есть наезд — поставь плейхед в свободное место'); return; }
+  if (!slot) { toast('Здесь уже стоит другой блок — поставь плейхед в свободное место'); return; }
   pushHist();
   const c = { id: newClipId(), kind: 'scale', t0: slot.t0, dur: slot.dur, ramp: 0.9, k: 1.4, ax: 0, ay: 0 };
   S.clips.push(c);
@@ -2834,12 +2965,13 @@ function addScaleClip() {
 function deleteClip(id) {
   const i = S.clips.findIndex(c => c.id === id);
   if (i < 0) return;
+  const wasScale = clipKind(S.clips[i]) === 'scale';   // тост зависит от вида блока (см. E.1 в брифе)
   pushHist();
   S.clips.splice(i, 1);
   if (S.sel === id) S.sel = null;
   if (selecting === id) endSelect();
   renderTimeline(); updateFocusMeta(); save();
-  toast('Наезд удалён');
+  toast(wasScale ? 'Масштаб удалён' : 'Наезд удалён');
 }
 
 /* Свободное окно на дорожке сцен — та же логика, что у наездов. */
@@ -2914,6 +3046,7 @@ function selectClip(id) {
 /* ---------------------------------------------------------- переходы --- */
 
 function selectTrans(id) {
+  trPopPreSnap = null;   // сменился/снялся выбор — незавершённая протяжка #trPopRange больше не в счёт
   S.selTrans = id;
   S.selMedia = null;
   [...$('#trkVideo').querySelectorAll('.clip')].forEach(el => el.classList.remove('sel'));
@@ -2932,7 +3065,7 @@ function selectTrans(id) {
    самого клипа (см. C.5 в брифе).                                        */
 function maxTransDur(clipId, edge) {
   const a = getMedia(clipId);
-  let maxDur = 2.0;
+  let maxDur = 3.0;
   if (a) {
     maxDur = Math.min(maxDur, a.dur);
     if (edge === 'out' && isStitch(a)) {
@@ -2941,6 +3074,17 @@ function maxTransDur(clipId, edge) {
     }
   }
   return maxDur;
+}
+
+/* Какие ручки показывать на маркере перехода (см. A.1 в брифе): 'in' —
+   маркер прижат к началу клипа, тянуть можно только вправо; одиночный
+   'out' (соседа нет) — маркер у конца клипа, тянуть можно только влево;
+   стык ('out' + isStitch) — маркер сидит на границе, обе стороны свободны. */
+function transHandleSides(tr) {
+  if (tr.edge === 'in') return { l: false, r: true };
+  const a = getMedia(tr.clip);
+  if (a && isStitch(a)) return { l: true, r: true };
+  return { l: true, r: false };
 }
 
 /* Низкоуровневый конструктор — ставит переход на конкретный край конкретного
@@ -2958,6 +3102,7 @@ function addTransitionAt(clipId, edge, dur = 0.5) {
   S.trans.push(tr);
   S.selTrans = tr.id;
   S.selMedia = null;
+  trPopPreSnap = null;   // выбор перехода сменился в обход selectTrans() — снимок протяжки старого #trPopRange больше не в счёт (см. находку)
   renderTimeline(); updateVideoMeta(); save();
   toast('Переход добавлен');
   return tr;
@@ -3022,7 +3167,7 @@ function setTransDur(id, dur) {
   const tr = getTrans(id);
   if (!tr) return;
   const maxDur = maxTransDur(tr.clip, tr.edge);
-  tr.dur = Math.round(clamp(dur, 0.2, Math.max(0.2, maxDur)) * 100) / 100;
+  tr.dur = Math.round(clamp(dur, 0.1, Math.max(0.1, maxDur)) * 100) / 100;
   // Панель #videoMeta тут намеренно не перестраиваем: это дёргает ползунок
   // прямо во время протяжки (input срабатывает на каждый шаг) — обновляем
   // только маркер на дорожке и подпись значения, см. вызов в updateVideoMeta.
@@ -3038,7 +3183,19 @@ function onClipDown(e, id, mode) {
   e.preventDefault();
   const c = dragTarget(id);
   if (!c) return;
-  if (isSceneId(id)) selectScene(id); else if (isMediaId(id)) selectMedia(id); else selectClip(id);
+  if (isSceneId(id)) selectScene(id);
+  else if (isMediaId(id)) {
+    // Если у ЭТОГО клипа уже выбран его собственный переход (маркер .sel,
+    // открыт #trPop) — обычный selectMedia() тут же обнулил бы S.selTrans и
+    // прятал поповер ещё на pointerdown, до первого движения мыши, хотя
+    // маркер и так честно едет вместе с клипом на каждом кадре драга
+    // (layoutJunctions вызывается из обработчика ниже) — см. находку, AC-D5.
+    // Оставляем выбор перехода как есть; клик по любому другому клипу (или
+    // без выбранного своего перехода) работает как раньше.
+    const curTr = getTrans(S.selTrans);
+    if (!(curTr && curTr.clip === id)) selectMedia(id);
+  }
+  else selectClip(id);
   clipDrag = { id, mode, t: xToTraw(e.clientX), t0: c.t0, dur: c.dur, inPoint: c.inPoint || 0, snap: snap() };
   // При обрезке видео замораживаем плёнку в исходных px — иначе кадры растягиваются
   // вместе с div, а должны обрезаться (см. D.4 в брифе).
@@ -3125,6 +3282,54 @@ window.addEventListener('pointerup', () => {
   }
 });
 
+/* --- ручки на маркере перехода: протяжка длительности прямо на дорожке
+   (см. A в брифе) --- */
+let trDrag = null;
+
+function onTransHandleDown(e, id, side) {
+  e.stopPropagation();
+  e.preventDefault();
+  const tr = getTrans(id);
+  if (!tr) return;
+  selectTrans(id);
+  trDrag = { id, side, x0: e.clientX, dur0: tr.dur, snap: snap() };
+  try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
+}
+
+window.addEventListener('pointermove', e => {
+  if (!trDrag) return;
+  const tr = getTrans(trDrag.id);
+  if (!tr) { trDrag = null; return; }
+  const pps = S.tl.pps || 1;
+  const dt = (e.clientX - trDrag.x0) / pps;
+  const a = getMedia(tr.clip);
+  const stitch = tr.edge === 'out' && !!(a && isStitch(a));
+  let dur;
+  if (stitch) {
+    // Маркер стыка стоит по центру границы — тянуть одну ручку двигает
+    // обе половины симметрично, поэтому шаг вдвое больше сдвига мыши.
+    dur = trDrag.side === 'r' ? trDrag.dur0 + 2 * dt : trDrag.dur0 - 2 * dt;
+  } else if (tr.edge === 'in') {
+    dur = trDrag.dur0 + dt;         // маркер прижат к началу клипа, растёт вправо
+  } else {
+    dur = trDrag.dur0 - dt;         // одиночный 'out' прижат к концу клипа, растёт влево
+  }
+  setTransDur(tr.id, dur);
+  syncTransDurUI(tr);
+});
+
+function endTrDrag() {
+  if (trDrag) {
+    if (snap() !== trDrag.snap) pushHist(trDrag.snap);
+    trDrag = null;
+    save();
+  }
+}
+// pointercancel — не только pointerup: без него отменённый жест (потеря
+// capture, системный жест поверх) оставлял trDrag висеть, и следующий
+// pointermove без нажатой кнопки продолжал менять длительность (см. находку).
+['pointerup', 'pointercancel'].forEach(ev => window.addEventListener(ev, endTrDrag));
+
 /* --- скраб по дорожкам --- */
 let scrubbing = false;
 function scrubFrom(e) { seekTo(xToT(e.clientX)); }
@@ -3200,15 +3405,14 @@ function layoutClip(c) {
 
 /* .clip создаёт свой стекинговый контекст (position+z-index), поэтому её
    ручки обрезки .h (z-index:2 внутри .clip) физически не могут оказаться
-   выше .jn/.tr (z-index:6) — они сравниваются с соседями по z-index самой
-   .clip (2, или 5 у .sel), который меньше 6 в любом случае. Раздвинуть их
-   через z-index нельзя, только геометрией: держим .jn.edge и одиночный
-   (не стыковой) .tr на расстоянии HANDLE_CLEAR+радиус от истинного края
-   клипа, чтобы ручка (12px, см. .clip .h в style.css) оставалась кликабельна
-   (см. finding #1 — было перекрыто 10-11 из 12px хиттеста ручки).         */
-const HANDLE_CLEAR = 15;   // 12px ручка + 3px запас, в экранных px
-const JN_RADIUS = 10;      // половина .jn (20px, border-radius:50%, style.css)
-const EDGE_JN_MIN_W = 2 * (HANDLE_CLEAR + JN_RADIUS) + 8;   // уже — крайнюю «+» прячем
+   выше .jn/.tr (z-index:6) через z-index — они сравниваются с соседями по
+   z-index самой .clip (2, или 5 у .sel), который меньше 6 в любом случае
+   (см. finding #1). Раньше это чинили запасом по X и точечными разъездами
+   ручек на стыке — теперь полоска переходов и клипы разведены по высоте
+   дорожки (см. #trkVideo/.clip.media/.jn/.tr в style.css): они физически
+   не перекрываются, и координаты ниже можно ставить без всякого запаса.   */
+const JN_RADIUS = 7;       // половина .jn (14px, border-radius:6px, style.css)
+const EDGE_JN_MIN_W = 2 * JN_RADIUS + 8;   // узко — крайнюю «+» прячем, чтобы не наложилась на стыковую «+» рядом
 
 /* Позиции «+»-кнопок и маркеров переходов — отдельно от renderTimeline(),
    чтобы во время перетаскивания клипа они ехали вместе с ним без пересборки
@@ -3223,13 +3427,16 @@ function layoutJunctions() {
     if (jn.classList.contains('edge')) {
       const edgeClip = jn.dataset.role === 'start' ? list[0] : list[list.length - 1];
       if (!edgeClip) { jn.remove(); continue; }
-      // На клипе уже ~60px кнопка, отодвинутая от ручки, села бы на стыковую
-      // «+» соседа и его ручки — прячем; переход туда всё равно ставится
-      // клавишей T или кнопкой «Переход».
+      // Слишком узкий крайний клип — краевая «+» может наложиться на
+      // стыковую «+» соседа (обе теперь в одной узкой полоске переходов) —
+      // прячем; переход туда всё равно ставится клавишей T или кнопкой
+      // «Переход».
       jn.style.display = edgeClip.dur * pps < EDGE_JN_MIN_W ? 'none' : '';
+      // Кнопку на самом краю дорожки прижимаем внутрь на радиус: .trk режет
+      // всё за своей границей (overflow:hidden), и в нуле осталась бы половина.
       const px = jn.dataset.role === 'start'
-        ? edgeClip.t0 * pps + HANDLE_CLEAR + JN_RADIUS
-        : mediaEnd(edgeClip) * pps - HANDLE_CLEAR - JN_RADIUS;
+        ? Math.max(edgeClip.t0 * pps, JN_RADIUS)
+        : Math.min(mediaEnd(edgeClip) * pps, rectW - JN_RADIUS);
       jn.style.left = (px / rectW * 100) + '%';
       continue;
     }
@@ -3242,25 +3449,32 @@ function layoutJunctions() {
     const a = tr ? getMedia(tr.clip) : null;
     if (!tr || !a) { el.remove(); continue; }
     const wPx = Math.max(26, (tr.dur / D) * rectW);
-    // стык — маркер по центру границы (как раньше, обеим сторонам своя
-    // ручка не грозит — там нет ручки посередине); одиночный край — маркер
-    // тянется к реальному месту затемнения (C.4), но не ближе HANDLE_CLEAR
-    // к внешнему краю клипа, где иначе накрыл бы его же .h целиком.
+    // Полоска переходов не делит высоту с ручками клипа (см. комментарий
+    // выше), поэтому центрируем без всякого запаса: на стыке — точно на
+    // границе, у одиночного края — своим краем вплотную к краю клипа.
     let centerPx;
     if (tr.edge === 'out') {
       const endPx = mediaEnd(a) * pps;
-      centerPx = isStitch(a) ? endPx
-        : Math.min(endPx - tr.dur / 2 * pps, endPx - HANDLE_CLEAR - wPx / 2);
+      centerPx = isStitch(a) ? endPx : endPx - wPx / 2;
     } else {
       const startPx = a.t0 * pps;
-      centerPx = Math.max(startPx + tr.dur / 2 * pps, startPx + HANDLE_CLEAR + wPx / 2);
+      centerPx = startPx + wPx / 2;
     }
     el.style.left = (centerPx / rectW * 100) + '%';
     el.style.width = wPx + 'px';
     el.classList.toggle('sel', tr.id === S.selTrans);
     const lbl = el.querySelector('.x');
-    if (lbl) lbl.textContent = `◆ ${tr.dur.toFixed(1)}с`;
+    if (lbl) lbl.textContent = `◆ ${fmtDur(tr.dur)}с`;
+    // Какая сторона стыка — может смениться на лету: перетаскивание клипа
+    // способно и создать стык (соседа подтянули впритык), и разорвать его
+    // (см. A.1 в брифе) — пересчитываем при каждой раскладке, не только при
+    // создании маркера в renderTimeline().
+    const sides = transHandleSides(tr);
+    const hl = el.querySelector('.h.l'), hr = el.querySelector('.h.r');
+    if (hl) hl.hidden = !sides.l;
+    if (hr) hr.hidden = !sides.r;
   }
+  layoutTrPop();
 }
 
 function renderTimeline() {
@@ -3351,8 +3565,15 @@ function renderTimeline() {
     el.className = 'tr' + (tr.id === S.selTrans ? ' sel' : '');
     el.dataset.id = tr.id;
     el.title = 'Переход · затемнение';
-    el.innerHTML = `<div class="x">◆ ${tr.dur.toFixed(1)}с</div>`;
+    // Ручки — прямое управление длительностью прямо на маркере (см. A в
+    // брифе), а не только через ползунок в левой панели, который надо
+    // сперва найти. Какие из них показывать — решает layoutJunctions()
+    // (там же, где известно, стык это или одиночный край, и она вызывается
+    // при любом сдвиге клипов, не только при создании маркера).
+    el.innerHTML = `<div class="h l"></div><div class="x">◆ ${fmtDur(tr.dur)}с</div><div class="h r"></div>`;
     el.addEventListener('pointerdown', e => { e.stopPropagation(); selectTrans(tr.id); });
+    el.querySelector('.h.l').addEventListener('pointerdown', e => onTransHandleDown(e, tr.id, 'l'));
+    el.querySelector('.h.r').addEventListener('pointerdown', e => onTransHandleDown(e, tr.id, 'r'));
     trkV.appendChild(el);
   }
   if (needStrip) scheduleStrip();
@@ -3959,6 +4180,43 @@ function buildUI() {
   $('#btnTrimL').addEventListener('click', () => trimToPlayhead('head'));
   $('#btnTrimR').addEventListener('click', () => trimToPlayhead('tail'));
   $('#btnTrans').addEventListener('click', addTransitionAtPlayhead);
+
+  // Всплывающая панель над маркером перехода (#trPop, см. B в брифе) — один
+  // статический элемент в body, слушатели вешаем один раз, а не при каждом
+  // layoutTrPop() (та лишь двигает панель и обновляет подпись/значение).
+  {
+    const popRange = $('#trPopRange');
+    popRange.addEventListener('input', () => {
+      const tr = getTrans(S.selTrans); if (!tr) return;
+      if (trPopPreSnap === null) trPopPreSnap = snap();   // снимок один раз в начале протяжки, как у transDurRange
+      syncingRangeSelf = popRange;
+      setTransDur(tr.id, +popRange.value);
+      syncTransDurUI(tr);
+      syncingRangeSelf = null;
+    });
+    popRange.addEventListener('change', () => {
+      if (trPopPreSnap !== null && snap() !== trPopPreSnap) pushHist(trPopPreSnap);
+      trPopPreSnap = null;
+      const tr = getTrans(S.selTrans);
+      if (tr) { setTransDur(tr.id, +popRange.value); syncTransDurUI(tr); }
+    });
+    $('#trPopDel').addEventListener('click', () => { if (S.selTrans) deleteTransition(S.selTrans); });
+  }
+  $('#tlwrap').addEventListener('scroll', () => layoutTrPop(), { passive: true });
+  // Клик вне попапа/маркера/дорожки/блока перехода в левой панели снимает
+  // выбор перехода (см. B.4 в брифе). Исключаем #videoMeta, а не весь
+  // #panel: тот же переход редактируется там же ползунком #transDurRange и
+  // кнопкой «Удалить переход» — без исключения первый pointerdown по самому
+  // ползунку сбрасывал бы выбор раньше, чем успеет сработать протяжка. Но
+  // весь #panel — это ещё и «Фон», «Экспорт» и остальные разделы, к
+  // переходу не относящиеся: клик там должен снимать выбор, как и везде
+  // вне блока перехода (было исключение шире необходимого, см. находку).
+  document.addEventListener('pointerdown', e => {
+    if (!S.selTrans) return;
+    if (!(e.target instanceof Element) || e.target.closest('#trPop, .tr, #tlwrap, #videoMeta')) return;
+    selectTrans(null);
+  });
+
   $('#btnZoomOut').addEventListener('click', () => setZoom(S.tl.pps / 1.25, clock));
   $('#btnZoomIn').addEventListener('click', () => setZoom(S.tl.pps * 1.25, clock));
   $('#btnZoomFit').addEventListener('click', fitZoom);
@@ -4105,8 +4363,9 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   setPose: p => { Object.assign(S.pose, p); syncPoseUI(); },
   setPlaying: v => setPlaying(v),
   splitMediaAt, trimToPlayhead, addTransition: addTransitionAt, deleteTransition, setTransDur, transFade, selectTrans,
-  addTransitionAtPlayhead,
+  addTransitionAtPlayhead, maxTransDur, layoutTrPop,
   undo, redo, hist, gcPool, snapT, thumbCache, layoutJunctions,
   setZoom, fitZoom, layoutTimeline, contentW, tlViewW, updatePlayhead,
   get tl() { return S.tl },
+  get trDrag() { return trDrag },
   get clock() { return clock } };
