@@ -170,6 +170,19 @@ button.ghost{background:transparent}
 /* плёнка кадров внутри клипа видео — под подписью, обрезается вместе с .clip */
 .thumbs{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;display:block}
 .clip.media b{text-shadow:0 1px 3px #000d,0 0 8px #000b}
+/* Стоп-кадр: застывший край клипа за пределами исходника (см. holdHead/
+   holdTail в app.js) — диагональная штриховка поверх плёнки, но ниже
+   подписи .b (z-index:1 у неё выше); граница — со стороны живого видео,
+   т.е. у .hold.l справа, у .hold.r слева. Ширину и display:none/'block' задаёт
+   layoutMedia() в px (holdHead/holdTail * pps), тут только внешний вид —
+   базовый display:none ниже обязателен, чтобы клип без стоп-кадра ничего
+   не показывал, пока layoutMedia не выставит инлайновый 'block'. */
+.clip.media .hold{position:absolute;top:0;bottom:0;display:none;pointer-events:none;overflow:hidden;
+  background:repeating-linear-gradient(45deg,#ffffff22 0 6px,transparent 6px 12px)}
+.clip.media .hold.l{left:0;border-right:1px solid #ffffff55}
+.clip.media .hold.r{right:0;border-left:1px solid #ffffff55}
+.clip.media .hold span{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  font-size:8px;opacity:.7;white-space:nowrap;pointer-events:none}
 .clip .h{position:absolute;top:0;bottom:0;width:12px;cursor:ew-resize;z-index:2}
 .clip .h:before{content:"";position:absolute;top:35%;bottom:35%;left:3px;width:2px;border-radius:2px;background:#ffffffb0;
   opacity:0;transition:opacity .12s}

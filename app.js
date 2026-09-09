@@ -432,6 +432,18 @@ function transOnEdge(clipId, edge) { return S.trans.find(x => x.clip === clipId 
 function mediaEnd(m) { return m.t0 + m.dur; }
 function sortedMedia() { return S.media.slice().sort((a, b) => a.t0 - b.t0); }
 function getMedia(id) { return S.media.find(m => m.id === id) || null; }
+/* Стоп-кадр (см. бриф «Стоп-кадр»): клип можно тянуть за край дальше, чем
+   реально снято в исходнике — тогда inPoint уходит в минус (заморозка у
+   начала) или dur уходит за (natDur − inPoint) (заморозка у конца). Обе
+   функции возвращают, сколько «виртуальных» секунд с этого края клипа —
+   застывший крайний кадр, а не настоящее видео; 0, когда края не выходят
+   за исходник или pool ещё не готов (natDur неизвестен).                  */
+function holdHead(m) { return Math.max(0, Math.min(m.dur, -(m.inPoint || 0))); }
+function holdTail(m) {
+  const p = mediaPool[m.id];
+  if (!p) return 0;
+  return Math.max(0, Math.min(m.dur, m.dur - (p.natDur - (m.inPoint || 0))));
+}
 /* Следующий по времени клип после m — или null, если m последний. */
 function nextMediaOf(m) {
   const list = sortedMedia();
@@ -469,7 +481,24 @@ function syncMedia(t, wantPlay) {
     if (!a || p !== a.pool) { if (!p.video.paused) p.video.pause(); }
   }
   if (!a) return;
-  const v = a.pool.video, want = clamp(a.local, 0, Math.max(0, a.pool.natDur - 0.03));
+  const v = a.pool.video, edge = Math.max(0, a.pool.natDur - 0.03);
+  // Стоп-кадр: local вне [0, natDur) — клип растянут дальше исходника, и
+  // этот край сейчас должен показывать застывший крайний кадр, а не живое
+  // видео. Держим currentTime у самого края и ставим на паузу НЕЗАВИСИМО
+  // от wantPlay: video.play() у уже закончившегося (ended) видео по
+  // спецификации сам перематывает currentTime на 0 — если бы мы вызвали
+  // play() в хвостовом стоп-кадре, вместо застывшего последнего кадра
+  // тут же поехало бы воспроизведение сначала. Поэтому в этой ветке play()
+  // не вызывается вообще. Порог перемотки ниже, чем в живой зоне (0.05
+  // вместо 0.2) — здесь currentTime сам не течёт (видео на паузе), так что
+  // даже небольшой снос уже заметен и не требует «гасить» дрожание.
+  if (a.local < 0 || a.local >= edge) {
+    const want = a.local < 0 ? 0 : edge;
+    if (Math.abs(v.currentTime - want) > 0.05) { try { v.currentTime = want; } catch (_) {} }
+    if (!v.paused) v.pause();
+    return;
+  }
+  const want = clamp(a.local, 0, edge);
   if (Math.abs(v.currentTime - want) > 0.2 || v.seeking === undefined) {
     try { v.currentTime = want; } catch (_) {}
   }
@@ -2516,9 +2545,17 @@ function updateVideoMeta() {
   if (!S.media.length) { el.textContent = 'Видео нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
   const cur = getMedia(S.selMedia) || sortedMedia()[0];
   const p = mediaPool[cur.id];
+  // Стоп-кадр: если клип растянут за исходник хоть с одной стороны — отдельная
+  // строка в панели, называет только реально присутствующие края (см. D в брифе).
+  const hh = holdHead(cur), ht = holdTail(cur);
+  const holdBits = [];
+  if (hh > 0.005) holdBits.push(`в начале ${fmtDur(hh)} с`);
+  if (ht > 0.005) holdBits.push(`в конце ${fmtDur(ht)} с`);
+  const holdLine = holdBits.length ? `<br><span style="color:#8b93a7">Стоп-кадр: ${holdBits.join(', ')}</span>` : '';
   el.innerHTML = `<b style="color:#c6ccdc">${cur.name}</b><br>` +
     (p ? `${p.w}×${p.h} · ` : '') + `${cur.t0.toFixed(1)}–${mediaEnd(cur).toFixed(1)} с` +
     (S.media.length > 1 ? `<br><span style="color:#8b93a7">Всего роликов: ${S.media.length}, общая длина ${mediaDur().toFixed(1)} с</span>` : '') +
+    holdLine +
     `<div class="row" style="margin-top:8px;gap:6px">` +
     `<button class="ghost" id="btnClipSplit" title="S — разделить по плейхеду">✂ Разделить по плейхеду</button>` +
     `<button class="ghost" id="btnClipDelete">Удалить клип</button>` +
@@ -3242,7 +3279,13 @@ window.addEventListener('pointermove', e => {
     if (isMediaId(clipDrag.id)) {                 // тянем начало = двигаем точку входа
       const p = mediaPool[c.id];
       const inp = (clipDrag.inPoint || 0) + (c.t0 - clipDrag.t0);
-      c.inPoint = clamp(inp, 0, p ? Math.max(0, p.natDur - 0.3) : 0);
+      // Нижнего клампа в 0 больше нет: inPoint может уйти в минус — это и
+      // есть стоп-кадр у начала (см. holdHead). Ограничивать его отдельно
+      // не нужно — насколько влево можно уехать, и так решает t0 (clamp
+      // выше по loBound: сосед слева или 0), а inp — просто его производная.
+      // Верхний край (natDur − 0.3) оставляем: край живого видео не должен
+      // сжаться до нуля целиком в стоп-кадр только с одной стороны.
+      c.inPoint = p ? Math.min(inp, Math.max(0, p.natDur - 0.3)) : 0;
     }
   } else {
     const rawEnd = clipDrag.t0 + clipDrag.dur + d;
@@ -3253,9 +3296,9 @@ window.addEventListener('pointermove', e => {
   c.dur = Math.round(c.dur * 100) / 100;
   if (isSceneId(clipDrag.id)) { layoutScene(c); updateSceneMeta(); }
   else if (isMediaId(clipDrag.id)) {
-    // обрезка справа не должна выйти за исходную длину файла
-    const p = mediaPool[c.id];
-    if (p) c.dur = Math.min(c.dur, p.natDur - (c.inPoint || 0));
+    // Стоп-кадр: обрезка/растяжка вправо больше не зажата длиной исходника —
+    // клип можно тянуть за p.natDur, тогда хвост (см. holdTail) держит
+    // застывший последний кадр вместо реального видео (см. syncMedia).
     layoutMedia(c); updateVideoMeta(); layoutJunctions();
     if (clipDrag.thumbsEl) {
       clipDrag.thumbsEl.style.width = clipDrag.thumbsW + 'px';
@@ -3371,9 +3414,28 @@ function layoutMedia(m) {
   const D = tlDur();
   el.style.left = tToPct(m.t0) + '%';
   el.style.width = Math.max(0.4, (m.dur / D) * 100) + '%';
+  const hh = holdHead(m), ht = holdTail(m);
+  // Сумма стоп-кадра в подписи — без ложного округления (fmtDur обрезает
+  // лишние нули, а не toFixed(1), который "0.05" превратил бы в "0.1").
+  const holdSuffix = (hh + ht) > 0.005 ? ` · стоп-кадр ${fmtDur(hh + ht)} с` : '';
   const short = m.name.length > 18 ? m.name.slice(0, 18) + '…' : m.name;
-  el.querySelector('b').textContent = `${short} · ${m.dur.toFixed(1)} с`;
+  el.querySelector('b').textContent = `${short} · ${m.dur.toFixed(1)} с${holdSuffix}`;
   el.classList.toggle('sel', m.id === S.selMedia);
+
+  // Штриховка стоп-кадра: ширина в px = holdHead/holdTail * pps — столько
+  // же пикселей на секунду, во сколько на самом деле рендерится сам клип
+  // (его % ширины посчитан от tlDur()=contentW()/pps, то есть его px-ширина
+  // на экране всегда равна m.dur*pps — см. D в брифе). Подпись «стоп-кадр»
+  // внутри штриховки показываем, только если она реально помещается.
+  const pps = S.tl.pps || 1;
+  const holdL = el.querySelector('.hold.l'), holdR = el.querySelector('.hold.r');
+  const wL = hh * pps, wR = ht * pps;
+  holdL.style.display = wL > 0.5 ? 'block' : 'none';
+  holdL.style.width = wL + 'px';
+  holdL.querySelector('span').style.display = wL > 40 ? '' : 'none';
+  holdR.style.display = wR > 0.5 ? 'block' : 'none';
+  holdR.style.width = wR + 'px';
+  holdR.querySelector('span').style.display = wR > 40 ? '' : 'none';
 }
 
 function layoutScene(b) {
@@ -3502,7 +3564,12 @@ function renderTimeline() {
     const el = document.createElement('div');
     el.className = 'clip media' + (m.id === S.selMedia ? ' sel' : '');
     el.dataset.id = m.id;
-    el.innerHTML = '<canvas class="thumbs"></canvas><b></b><div class="h l"></div><div class="h r"></div><div class="x">×</div>';
+    // .hold.l/.hold.r — застывшие края стоп-кадра (см. holdHead/holdTail),
+    // рисуются поверх плёнки, но под подписью .b (z-index у неё выше) —
+    // порядок в DOM важен: после thumbs (лежат над плёнкой), до b/.h/.x.
+    el.innerHTML = '<canvas class="thumbs"></canvas>' +
+      '<div class="hold l"><span>стоп-кадр</span></div><div class="hold r"><span>стоп-кадр</span></div>' +
+      '<b></b><div class="h l"></div><div class="h r"></div><div class="x">×</div>';
     el.addEventListener('pointerdown', e => onClipDown(e, m.id, 'move'));
     el.querySelector('.h.l').addEventListener('pointerdown', e => onClipDown(e, m.id, 'l'));
     el.querySelector('.h.r').addEventListener('pointerdown', e => onClipDown(e, m.id, 'r'));
@@ -4355,7 +4422,7 @@ init();
 /* хук для отладки/автотестов */
 window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS, POSES, addClip, deleteClip,
   addScaleClip, clipKind,
-  addVideoFiles, deleteMedia, clearVideo, mediaDur, mediaAt, syncMedia, mediaPool,
+  addVideoFiles, deleteMedia, clearVideo, mediaDur, mediaAt, syncMedia, mediaPool, holdHead, holdTail,
   addScene, applyReel, deleteScene, sceneFade, sceneAt,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
