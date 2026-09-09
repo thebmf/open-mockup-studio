@@ -1633,6 +1633,10 @@ let clipSeq = 1;
 
 function clipEnd(c) { return c.t0 + c.dur; }
 function getClip(id) { return S.clips.find(c => c.id === id) || null; }
+/* Клип на дорожке «наезды» бывает двух видов: 'region' — наезд на обведённый
+   участок экрана (исходный режим), 'scale' — просто push-in всего кадра.
+   Старые сохранённые клипы поля kind не имеют — такие всегда 'region'.      */
+function clipKind(c) { return c && c.kind === 'scale' ? 'scale' : 'region'; }
 /* Блок сценария живёт на своей дорожке, но двигается и режется тем же кодом. */
 const isSceneId = id => typeof id === 'string' && id.startsWith('s');
 const isMediaId = id => typeof id === 'string' && id.startsWith('m');
@@ -1663,6 +1667,7 @@ function focusAt(t) {
 }
 
 let lastRender = null, lastGrid = null;
+let lastCam = null;        // камера последнего draw() — для отладки/автотестов (__ms.lastCam)
 let drawTime = 0;          // время кадра: по нему выбирается активный видеоклип
 let lightPos = { x: 0, y: 0 };      // смещение пятна света в текущем кадре
 
@@ -1734,25 +1739,40 @@ function draw(t) {
   const fa = sel ? { k: 0, clip: null } : focusAt(t);
   const k = fa.k;
   if (k > 0.0005 && fa.clip) {
-    const xf0 = makeXform(rx, ry, rz, d, cx, cy, idc);
-    const hw = info.bw / 2, hh = info.bh / 2;
-    const q0 = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => xf0.proj(xf0.p3(x, y, T / 2)));
-    const Hm = homography(q0);
     const f = fa.clip;
-    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    for (const [u, v] of [[f.u0, f.v0], [f.u1, f.v0], [f.u1, f.v1], [f.u0, f.v1]]) {
-      const [px, py] = hmap(Hm, (info.sx + u * info.sw) / info.W, (info.sy + v * info.sh) / info.H);
-      x0 = Math.min(x0, px); y0 = Math.min(y0, py);
-      x1 = Math.max(x1, px); y1 = Math.max(y1, py);
+    if (clipKind(f) === 'scale') {
+      /* Масштаб — push-in всего кадра целиком, а не отдельно телефона: без
+         homography по силуэту, просто камера едет к точке (ax,ay) от центра
+         кадра. cam.s ниже уходит и в drawBackground(), и в формулу DOF —
+         фон размывается и уезжает совершенно так же, как при наезде на
+         участок экрана, разница только в том, что тут нет области.        */
+      cam = {
+        s: lerp(1, f.k, k),
+        cx: lerp(W / 2, W / 2 + f.ax * W, k),
+        cy: lerp(H / 2, H / 2 + f.ay * H, k),
+        ox: W / 2, oy: H / 2,
+      };
+    } else {
+      const xf0 = makeXform(rx, ry, rz, d, cx, cy, idc);
+      const hw = info.bw / 2, hh = info.bh / 2;
+      const q0 = [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]].map(([x, y]) => xf0.proj(xf0.p3(x, y, T / 2)));
+      const Hm = homography(q0);
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const [u, v] of [[f.u0, f.v0], [f.u1, f.v0], [f.u1, f.v1], [f.u0, f.v1]]) {
+        const [px, py] = hmap(Hm, (info.sx + u * info.sw) / info.W, (info.sy + v * info.sh) / info.H);
+        x0 = Math.min(x0, px); y0 = Math.min(y0, py);
+        x1 = Math.max(x1, px); y1 = Math.max(y1, py);
+      }
+      const need = Math.min(W * f.fill / Math.max(1, x1 - x0), H * f.fill / Math.max(1, y1 - y0));
+      cam = {
+        s: lerp(1, Math.max(1, need), k),
+        cx: lerp(W / 2, (x0 + x1) / 2, k),
+        cy: lerp(H / 2, (y0 + y1) / 2, k),
+        ox: W / 2, oy: H / 2,
+      };
     }
-    const need = Math.min(W * f.fill / Math.max(1, x1 - x0), H * f.fill / Math.max(1, y1 - y0));
-    cam = {
-      s: lerp(1, Math.max(1, need), k),
-      cx: lerp(W / 2, (x0 + x1) / 2, k),
-      cy: lerp(H / 2, (y0 + y1) / 2, k),
-      ox: W / 2, oy: H / 2,
-    };
   }
+  lastCam = cam;
 
   /* Глубина резкости: чем ближе телефон (крупнее масштаб), тем сильнее размыт
      задник. Самый сильный «киношный» признак — и самый дешёвый.            */
@@ -1900,13 +1920,33 @@ function updateFocusMeta() {
   const c = selectedClip();
   const el = $('#fcMeta');
   const has = !!c;
-  ['fcFill', 'fcRamp'].forEach(id => { $('#' + id).disabled = !has; });
-  $('#btnSelect').disabled = !has;
+  const isScale = has && clipKind(c) === 'scale';
+  // Область (fcFill, «переобвести участок») имеет смысл только у 'region';
+  // увеличение и сдвиг (fcK/fcAX/fcAY) — только у 'scale'. fcRamp и fcDelete общие.
+  $('#fcFill').disabled = !has || isScale;
+  ['fcK', 'fcAX', 'fcAY'].forEach(id => { $('#' + id).disabled = !has || !isScale; });
+  $('#fcRamp').disabled = !has;
+  $('#btnSelect').disabled = !has || isScale;
+  $('#btnSelect').hidden = isScale;
+  $('#fcFillRow').hidden = isScale;
+  ['fcKRow', 'fcAXRow', 'fcAYRow'].forEach(id => { $('#' + id).hidden = !isScale; });
   $('#fcDelete').disabled = !has;
   if (!has) {
     el.textContent = S.clips.length
-      ? 'Выбери наезд на дорожке снизу, чтобы настроить.'
-      : 'Наездов нет. Добавь кнопкой «+ Наезд» под холстом.';
+      ? 'Выбери наезд или масштаб на дорожке снизу, чтобы настроить.'
+      : 'Наездов и масштабов нет. Добавь кнопками «+ Наезд» или «+ Масштаб» под холстом.';
+    return;
+  }
+  if (isScale) {
+    $('#fcK').value = c.k; $('#fcK').parentElement.querySelector('output').textContent = fmt('fcK', c.k);
+    $('#fcAX').value = c.ax; $('#fcAX').parentElement.querySelector('output').textContent = fmt('fcAX', c.ax);
+    $('#fcAY').value = c.ay; $('#fcAY').parentElement.querySelector('output').textContent = fmt('fcAY', c.ay);
+    $('#fcRamp').value = c.ramp; $('#fcRamp').parentElement.querySelector('output').textContent = c.ramp.toFixed(2) + 'с';
+    let shift = '';
+    if (Math.abs(c.ax) > 0.001 || Math.abs(c.ay) > 0.001) {
+      shift = ` · сдвиг X ${fmt('fcAX', c.ax)}, Y ${fmt('fcAY', c.ay)}`;
+    }
+    el.innerHTML = `Масштаб <b style="color:#c6ccdc">${c.t0.toFixed(1)}–${clipEnd(c).toFixed(1)} с</b> · ×${c.k.toFixed(2)}${shift}`;
     return;
   }
   $('#fcFill').value = c.fill; $('#fcFill').parentElement.querySelector('output').textContent = Math.round(c.fill * 100) + '%';
@@ -1927,6 +1967,8 @@ const FMT = {
   mAmount: v => v.toFixed(2) + '×', mSpeed: v => v.toFixed(2) + '×', mLoop: v => v.toFixed(1) + 'с',
   bitrate: v => v.toFixed(0) + ' Мбит',
   fcFill: v => (v * 100).toFixed(0) + '%', fcRamp: v => (+v).toFixed(2) + 'с',
+  fcK: v => (+v).toFixed(2) + '×', fcAX: v => ((+v) >= 0 ? '+' : '') + Math.round(+v * 100) + '%',
+  fcAY: v => ((+v) >= 0 ? '+' : '') + Math.round(+v * 100) + '%',
   mIdle: v => (+v).toFixed(2) + '×', thickK: v => (+v).toFixed(2) + '×',
   scEase: v => (+v * 100).toFixed(0) + '%', dofAmt: v => (+v * 100).toFixed(0) + '%',
   reflAmt: v => (+v * 100).toFixed(0) + '%', fxGlowAmt: v => (+v * 100).toFixed(0) + '%',
@@ -2762,15 +2804,31 @@ function addClip() {
   if (!slot) { toast('Здесь уже есть наезд — поставь плейхед в свободное место'); return; }
   pushHist();
   const prev = S.clips[S.clips.length - 1];
+  // Предыдущий клип мог оказаться масштабом — у него нет u0..v1, поэтому
+  // сид для новой области берём только у соседа того же вида ('region').
+  const prevRegion = prev && clipKind(prev) === 'region' ? prev : null;
   const c = {
-    id: newClipId(), t0: slot.t0, dur: slot.dur, ramp: 0.9, fill: 0.82,
-    u0: prev ? prev.u0 : 0.15, v0: prev ? prev.v0 : 0.22,
-    u1: prev ? prev.u1 : 0.85, v1: prev ? prev.v1 : 0.58,
+    id: newClipId(), kind: 'region', t0: slot.t0, dur: slot.dur, ramp: 0.9, fill: 0.82,
+    u0: prevRegion ? prevRegion.u0 : 0.15, v0: prevRegion ? prevRegion.v0 : 0.22,
+    u1: prevRegion ? prevRegion.u1 : 0.85, v1: prevRegion ? prevRegion.v1 : 0.58,
   };
   S.clips.push(c);
   S.sel = c.id;
   renderTimeline(); updateFocusMeta(); save();
   startSelect(c.id);
+}
+
+/* «+ Масштаб» — тот же блок на той же дорожке, но без обводки области:
+   телефон целиком плавно увеличивается и уменьшается обратно (см. draw()). */
+function addScaleClip() {
+  const slot = freeSlot(clock, 2.6);
+  if (!slot) { toast('Здесь уже есть наезд — поставь плейхед в свободное место'); return; }
+  pushHist();
+  const c = { id: newClipId(), kind: 'scale', t0: slot.t0, dur: slot.dur, ramp: 0.9, k: 1.4, ax: 0, ay: 0 };
+  S.clips.push(c);
+  S.sel = c.id;
+  renderTimeline(); updateFocusMeta(); save();
+  toast('Масштаб добавлен');
 }
 
 function deleteClip(id) {
@@ -3135,7 +3193,9 @@ function layoutClip(c) {
   const rp = Math.min(c.ramp, c.dur / 2) / c.dur * 100;
   el.querySelector('.ramp.l').style.width = rp + '%';
   el.querySelector('.ramp.r').style.width = rp + '%';
-  el.querySelector('b').textContent = `Наезд ${c.dur.toFixed(1)} с`;
+  el.querySelector('b').textContent = clipKind(c) === 'scale'
+    ? `Масштаб ×${c.k.toFixed(1)} · ${c.dur.toFixed(1)} с`
+    : `Наезд ${c.dur.toFixed(1)} с`;
 }
 
 /* .clip создаёт свой стекинговый контекст (position+z-index), поэтому её
@@ -3302,14 +3362,16 @@ function renderTimeline() {
   [...trk.querySelectorAll('.clip')].forEach(el => el.remove());
   for (const c of S.clips) {
     const el = document.createElement('div');
-    el.className = 'clip' + (c.id === S.sel ? ' sel' : '');
+    const kind = clipKind(c);
+    el.className = 'clip' + (kind === 'scale' ? ' scale' : '') + (c.id === S.sel ? ' sel' : '');
     el.dataset.id = c.id;
     el.innerHTML = '<div class="ramp l"></div><div class="ramp r"></div><b></b><div class="h l"></div><div class="h r"></div><div class="x">×</div>';
     el.addEventListener('pointerdown', e => onClipDown(e, c.id, 'move'));
     el.querySelector('.h.l').addEventListener('pointerdown', e => onClipDown(e, c.id, 'l'));
     el.querySelector('.h.r').addEventListener('pointerdown', e => onClipDown(e, c.id, 'r'));
     el.querySelector('.x').addEventListener('pointerdown', e => { e.stopPropagation(); deleteClip(c.id); });
-    el.addEventListener('dblclick', e => { e.stopPropagation(); startSelect(c.id); });
+    // У блока масштаба нет области экрана, которую можно переобвести.
+    if (kind !== 'scale') el.addEventListener('dblclick', e => { e.stopPropagation(); startSelect(c.id); });
     trk.appendChild(el);
     layoutClip(c);
   }
@@ -3892,6 +3954,7 @@ function buildUI() {
   $('#btnSelect').addEventListener('click', () => selecting ? endSelect() : startSelect(S.sel));
   $('#fcDelete').addEventListener('click', () => S.sel && deleteClip(S.sel));
   $('#btnAddZoom').addEventListener('click', addClip);
+  $('#btnAddScale').addEventListener('click', addScaleClip);
   $('#btnSplit').addEventListener('click', () => splitMediaAt());
   $('#btnTrimL').addEventListener('click', () => trimToPlayhead('head'));
   $('#btnTrimR').addEventListener('click', () => trimToPlayhead('tail'));
@@ -3913,15 +3976,27 @@ function buildUI() {
   $('#btnRecord2').addEventListener('click', () => recording ? stopRecording() : startRecording());
   const clipParam = (id, key, fmt) => {
     const el = $('#' + id), out = el.parentElement.querySelector('output');
+    // 'input' льётся на каждый пиксель протяжки — снимок для истории делаем
+    // один раз в начале протяжки (preSnap) и толкаем его один раз на 'change'
+    // (тот же приём, что у ползунка длительности перехода, см. transDurRange).
+    let preSnap = null;
     el.addEventListener('input', () => {
       const c = selectedClip(); if (!c) return;
+      if (preSnap === null) preSnap = snap();
       c[key] = +el.value;
       if (out) out.textContent = fmt(+el.value);
       layoutClip(c); save();
     });
+    el.addEventListener('change', () => {
+      if (preSnap !== null && snap() !== preSnap) pushHist(preSnap);
+      preSnap = null;
+    });
   };
   clipParam('fcFill', 'fill', v => Math.round(v * 100) + '%');
   clipParam('fcRamp', 'ramp', v => v.toFixed(2) + 'с');
+  clipParam('fcK', 'k', v => fmt('fcK', v));
+  clipParam('fcAX', 'ax', v => fmt('fcAX', v));
+  clipParam('fcAY', 'ay', v => fmt('fcAY', v));
 
   bind('fps',      'exp.fps',     'num');
   bind('bitrate',  'exp.bitrate', 'num');
@@ -3986,6 +4061,13 @@ function load() {
       if (!c.id) c.id = 'z' + (clipSeq++);
       const n = +String(c.id).replace(/\D/g, '');
       if (n >= clipSeq) clipSeq = n + 1;
+      // region-клипу без u0..v1 — как раньше, ничего не подставляем;
+      // scale-клипу без k/ax/ay — дефолты, чтобы draw() не считал с NaN.
+      if (clipKind(c) === 'scale') {
+        if (!isFinite(c.k)) c.k = 1.4;
+        if (!isFinite(c.ax)) c.ax = 0;
+        if (!isFinite(c.ay)) c.ay = 0;
+      }
     }
     if (S.sel && !S.clips.some(c => c.id === S.sel)) S.sel = null;
   } catch (_) {}
@@ -4014,11 +4096,12 @@ init();
 
 /* хук для отладки/автотестов */
 window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS, POSES, addClip, deleteClip,
+  addScaleClip, clipKind,
   addVideoFiles, deleteMedia, clearVideo, mediaDur, mediaAt, syncMedia, mediaPool,
   addScene, applyReel, deleteScene, sceneFade, sceneAt,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
-  get last(){ return lastRender }, get selecting(){ return selecting }, startSelect, endSelect,
+  get last(){ return lastRender }, get lastCam(){ return lastCam }, get selecting(){ return selecting }, startSelect, endSelect,
   setPose: p => { Object.assign(S.pose, p); syncPoseUI(); },
   setPlaying: v => setPlaying(v),
   splitMediaAt, trimToPlayhead, addTransition: addTransitionAt, deleteTransition, setTransDur, transFade, selectTrans,

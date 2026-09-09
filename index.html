@@ -105,14 +105,17 @@
     </details>
 
     <details open>
-      <summary>5 · Наезд на участок</summary>
+      <summary>5 · Наезд и масштаб</summary>
       <div class="body">
-        <div class="meta" id="fcMeta">Наездов нет. Добавь их на дорожке снизу кнопкой «+ Наезд».</div>
+        <div class="meta" id="fcMeta">Наездов и масштабов нет. Добавь кнопками «+ Наезд» или «+ Масштаб» под холстом.</div>
         <button id="btnSelect">Переобвести участок</button>
-        <div class="row"><label>Заполнение</label><input type="range" id="fcFill" min="0.4" max="1" step="0.01" value="0.82"><output></output></div>
+        <div class="row" id="fcFillRow"><label>Заполнение</label><input type="range" id="fcFill" min="0.4" max="1" step="0.01" value="0.82"><output></output></div>
+        <div class="row" id="fcKRow"><label>Увеличение</label><input type="range" id="fcK" min="1.05" max="2.5" step="0.05" value="1.4"><output></output></div>
+        <div class="row" id="fcAXRow"><label>Сдвиг X</label><input type="range" id="fcAX" min="-0.4" max="0.4" step="0.01" value="0"><output></output></div>
+        <div class="row" id="fcAYRow"><label>Сдвиг Y</label><input type="range" id="fcAY" min="-0.4" max="0.4" step="0.01" value="0"><output></output></div>
         <div class="row"><label>Плавность, с</label><input type="range" id="fcRamp" min="0.15" max="6" step="0.05" value="0.9"><output></output></div>
-        <button class="ghost" id="fcDelete">Удалить выбранный наезд</button>
-        <div class="hint">На дорожке «наезды» блок можно тянуть, растягивать за края и удалять крестиком. Двойной клик по блоку — переобвести участок экрана. Чем длиннее «плавность», тем мягче въезд и выезд.</div>
+        <button class="ghost" id="fcDelete">Удалить выбранный блок</button>
+        <div class="hint">На дорожке «наезды» блок можно тянуть, растягивать за края и удалять крестиком. Двойной клик по блоку наезда — переобвести участок экрана. Чем длиннее «плавность», тем мягче въезд и выезд. Блок масштаба увеличивает телефон целиком, без выделения области, и так же плавно возвращает его обратно.</div>
       </div>
     </details>
 
@@ -237,6 +240,7 @@
         <button id="btnRedo" class="tbtn" title="Повторить — ⌘⇧Z" disabled>↷</button>
         <div class="tc"><span id="tCur">0.0</span> / <span id="tDur">0.0</span> с</div>
         <button id="btnAddZoom" class="tbtn wide">+ Наезд</button>
+        <button id="btnAddScale" class="tbtn wide" title="Телефон крупнее на отрезке">+ Масштаб</button>
         <button id="btnSplit" class="tbtn wide" title="S — разделить по плейхеду" disabled>✂ Разделить</button>
         <button id="btnTrimL" class="tbtn wide" title="Q" disabled>⇤ Отрезать до</button>
         <button id="btnTrimR" class="tbtn wide" title="W" disabled>Отрезать после ⇥</button>
