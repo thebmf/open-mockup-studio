@@ -192,7 +192,7 @@ const SCENARIOS = [
   { id: 'revealLow', name: 'Взгляд снизу → общий план', dur: 10, tag: 'раскрытие',
     hint: 'макро на «острове», глядя на телефон снизу, потом долгий отъезд до общего плана.',
     keys: [
-      { t: 0,  drx: 30, dry: -3, drz: 0, ds: 1.60, dy: 0.60, lx: -0.06 },
+      { t: 0,  drx: 30, dry: 0,  drz: 0, ds: 1.60, dy: 0.60, lx: -0.06 },
       { t: 10, drx: 1,  dry: 0,  drz: 0, ds: -0.38, dy: 0.02, lx: 0.04, e: 'smooth' },
     ] },
 
@@ -327,14 +327,18 @@ function applyTempo(k) {
 }
 
 /* Лёгкое «дыхание» камеры поверх сценария — чтобы кадр не был мёртвым. */
+/* Дрейф включается плавно за первые 2 с: у шума на t=0 фазы ненулевые, и
+   без этого первый кадр был бы чуть повёрнут случайным образом — телефон
+   выглядел «криво направленным», хотя поза сценария ровная.              */
 function idleDrift(t) {
+  const k = EASES.smooth(clamp(t / 2, 0, 1));
   return {
-    dx:  nz(t * 0.31)          * 0.0040,
-    dy:  nz(t * 0.27 + 53.1)   * 0.0050,
-    drx: nz(t * 0.23 + 311.7)  * 0.55,
-    dry: nz(t * 0.29 + 407.2)  * 0.80,
-    drz: nz(t * 0.25 + 121.4)  * 0.32,
-    ds:  nz(t * 0.21 + 199.3)  * 0.0045,
+    dx:  nz(t * 0.31)          * 0.0040 * k,
+    dy:  nz(t * 0.27 + 53.1)   * 0.0050 * k,
+    drx: nz(t * 0.23 + 311.7)  * 0.55   * k,
+    dry: nz(t * 0.29 + 407.2)  * 0.80   * k,
+    drz: nz(t * 0.25 + 121.4)  * 0.32   * k,
+    ds:  nz(t * 0.21 + 199.3)  * 0.0045 * k,
   };
 }
 
@@ -2690,7 +2694,13 @@ function syncGutter() {
    существующие элементы; renderTimeline() зовёт её в конце после того, как
    сама пересобрала список DOM-узлов.                                      */
 function layoutTimeline() {
-  if (!S.tl.pps) S.tl.pps = clamp((tlViewW() - 8) / Math.max(3, sceneDuration() * 1.04), 4, 400);
+  // Масштаб подбираем только по настоящей ширине: у фоновой вкладки при
+  // старте она нулевая, и от заглушки tlViewW()=50 получался pps≈4 — полоса
+  // «на три минуты» под 10-секундный ролик, причём навсегда, S сохраняется.
+  // Пока ширины нет, pps остаётся 0, а при resize/появлении вкладки
+  // layoutTimeline() вызовется снова.
+  if (!S.tl.pps && $('#tlwrap').clientWidth > 120)
+    S.tl.pps = clamp((tlViewW() - 8) / Math.max(3, sceneDuration() * 1.04), 4, 400);
 
   const D = tlDur();
   $('#tlcontent').style.width = contentW() + 'px';
@@ -2724,6 +2734,7 @@ function layoutTimeline() {
 }
 
 window.addEventListener('resize', () => layoutTimeline());
+document.addEventListener('visibilitychange', () => { if (!document.hidden) layoutTimeline(); });
 
 function newClipId() { return 'z' + (clipSeq++); }
 
@@ -3960,6 +3971,7 @@ function load() {
     if (DEVICES[S.device] && !deviceColors(DEVICES[S.device]).includes(S.frame)) S.frame = deviceColors(DEVICES[S.device])[0];
     if (S.bg.type === 'image') S.bg.type = 'linear';   // картинку заново не восстановить
     S.media = [];  S.selMedia = null;      // blob-ссылки не переживают перезагрузку
+    S.tl.pps = 0;   // масштаб имеет смысл только относительно видео, а его после перезагрузки нет — подберётся заново
     S.trans = []; S.selTrans = null;       // переходы висят на медиа-клипах, тоже не переживают
     if (!Array.isArray(S.scenes)) S.scenes = [];
     S.scenes = S.scenes.filter(b => b && SCENARIOS.some(x => x.id === b.sc && x.dur > 0) && isFinite(b.t0) && b.dur > 0);
