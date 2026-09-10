@@ -396,7 +396,7 @@ const S = {
   dof:     { on: true,  amt: 0.5 },     // размытие задника, когда телефон близко
   reflect: { on: true,  amt: 0.32 },    // отражение в полу студии
   fx:      { islandShadow: true, glow: true, glowAmt: 0.45 },
-  media: [],                 // видео на дорожке: [{id,name,t0,dur,inPoint}]
+  media: [],                 // видео на дорожке: [{id,name,t0,dur,inPoint,src}]
   selMedia: null,
   trans: [],                 // переходы между соседними клипами: [{id,after,dur}]
   selTrans: null,
@@ -414,10 +414,13 @@ const video = $('#v');
 let bgImage = null;         // Image для фонового изображения
 /* Несколько видео/фото на дорожке: у каждого своя запись в пуле — видео
    держит <video> (kind:'video'), фото — <img> (kind:'image', natDur:Infinity,
-   без звука). Сам элемент в S не хранится — только запись клипа; blob-ссылки
-   не переживают перезагрузку, поэтому при восстановлении состояния клипы без
-   источника отбрасываются.                                                */
-const mediaPool = {};            // id → {kind, video|img, url, name, natDur, w, h, ready, frame?, frameTime?, pendingSeek?}
+   без звука). Сам элемент в S не хранится — только запись клипа; blob-URL из
+   мировой памяти вкладки не переживают перезагрузку, но сам файл переживает —
+   он лежит в IndexedDB по ключу srcId (= m.src у клипа, см. store ниже) и
+   пересоздаётся в restoreMedia() при старте. После split две S.media-записи
+   (m.id и rightId) делят один и тот же объект в пуле и один и тот же src —
+   см. splitMediaAt.                                                       */
+const mediaPool = {};            // id → {kind, video|img, url, name, natDur, w, h, ready, srcId, frame?, frameTime?, pendingSeek?}
 let mediaSeq = 1;
 const newMediaId = () => 'm' + (mediaSeq++);
 let hasVideo = false;            // есть хотя бы одно готовое медиа (видео или фото)
@@ -2184,6 +2187,83 @@ if (window.ResizeObserver) new ResizeObserver(es => {
 
 /* ================================================= загрузка медиа ======= */
 
+/* Хранилище файлов (IndexedDB). localStorage у save()/load() ниже хранит
+   только JSON S — сами File/Blob туда не лезут и, что важнее, не должны:
+   это разом убило бы синхронный save() на каждый чих. Файлы кладём в
+   отдельную базу mockup-studio/media по ключу src (= id клипа при
+   добавлении, см. srcId у pool-записи и m.src у клипа) и достаём обратно в
+   restoreMedia() при старте. Любая ошибка (нет IndexedDB в приватном окне,
+   переполнена квота и т.п.) не должна ронять монтаж — тайминги и так уже
+   в localStorage, теряется только сам файл; поэтому все функции тут ловят
+   исключения сами и никогда не бросают наружу.                            */
+const IDB_NAME = 'mockup-studio', IDB_VERSION = 1, IDB_STORE = 'media';
+let idbDB = null, idbWarned = false;
+
+function idbWarn(err) {
+  console.warn('IndexedDB недоступен, файл не сохранён в браузере:', err);
+  if (idbWarned) return;
+  idbWarned = true;   // тост — не чаще раза за сессию, дальше молча деградируем
+  toast('Не удалось сохранить файл в браузере — после перезагрузки его придётся добавить снова');
+}
+
+function idbOpen() {
+  if (idbDB) return Promise.resolve(idbDB);
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error('indexedDB недоступен')); return; }
+    let req;
+    try { req = indexedDB.open(IDB_NAME, IDB_VERSION); } catch (err) { reject(err); return; }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE, { keyPath: 'src' });
+    };
+    req.onsuccess = () => { idbDB = req.result; resolve(idbDB); };
+    req.onerror = () => reject(req.error);
+    req.onblocked = () => reject(new Error('indexedDB заблокирован другой вкладкой'));
+  });
+}
+/* rec: {src, name, type, blob} для файла с диска, {src, name, url} для
+   loadVideoUrl (там своего File нет — есть только чужой url).             */
+function idbPut(rec) {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(rec);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  })).catch(idbWarn);
+}
+function idbGet(src) {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(src);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  })).catch(err => { idbWarn(err); return null; });
+}
+function idbDelete(src) {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(src);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  })).catch(idbWarn);
+}
+function idbKeys() {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).getAllKeys();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  })).catch(err => { idbWarn(err); return []; });
+}
+function idbClear() {
+  return idbOpen().then(db => new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  })).catch(idbWarn);
+}
+
 /* Слушатель 'seeked' вешается на <video> один раз, сразу при создании
    элемента (и тут, и в loadVideoUrl) — досылает отложенную «последний
    позвал — тот и победил» перемотку из syncMedia, когда предыдущий seek()
@@ -2208,30 +2288,73 @@ function attachSeekLatch(id, v) {
   });
 }
 
-/* Каждое видео живёт в своём <video>. Клипы кладём встык в конец дорожки,
-   чтобы добавление нескольких файлов сразу давало смонтированный ряд.      */
-function addVideoFile(file, atEnd) {
+/* Общий конструктор pool-записи — единая точка, которой пользуются и
+   addVideoFile/addImageFile при первом добавлении файла, и restoreMedia()
+   при восстановлении после перезагрузки (см. A.3/B.2 в брифе), чтобы не
+   держать логику «дождаться loadedmetadata/onload и собрать {kind,...}» в
+   двух местах. ownsUrl — можно ли револьвить url при неудаче/выгрузке: true
+   для blob-URL, которые создали мы сами (свежий файл или File из
+   IndexedDB), false для чужого url (loadVideoUrl — путь вроде /demo.mp4,
+   revokeObjectURL по нему не делаем, как и раньше). seekId — id, на который
+   вешается attachSeekLatch для видео; неважно, какой именно из клипов,
+   которые в итоге будут ссылаться на эту запись, — латч всё равно найдёт её
+   и по ссылке на <video>, если понадобится (см. attachSeekLatch). Резолвит
+   null, если файл не читается — тост об этом решает вызывающий, тут разный
+   текст на разные случаи (добавили файл / не нашли при восстановлении).   */
+function makePool(kind, url, name, ownsUrl, seekId) {
   return new Promise(resolve => {
-    if (!file) return resolve(null);
-    const id = newMediaId();
-    const url = URL.createObjectURL(file);
-    const v = document.createElement('video');
-    v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
-    attachSeekLatch(id, v);
     const fail = () => {
-      URL.revokeObjectURL(url);
-      toast(`Не читается: ${file.name} — попробуй mp4/H.264 или webm`);
+      if (ownsUrl) { try { URL.revokeObjectURL(url); } catch (_) {} }
       resolve(null);
     };
-    v.addEventListener('error', fail, { once: true });
-    v.addEventListener('loadedmetadata', () => {
-      const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
-      if (!nat) return fail();
-      mediaPool[id] = { kind: 'video', video: v, url, name: file.name, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
-      S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: Math.round(nat * 100) / 100, inPoint: 0 });
-      hasVideo = true;
-      resolve(id);
-    }, { once: true });
+    if (kind === 'image') {
+      const img = new Image();
+      img.onerror = fail;
+      img.onload = () => {
+        if (!img.naturalWidth || !img.naturalHeight) return fail();
+        // Выгрузка (gcPool/clearVideo) освобождает фото через img.src = '' —
+        // это штатно бьёт по 'error', и если onerror всё ещё висит, следом за
+        // успешным удалением вылезал бы ложный тост да ещё и повторный
+        // revokeObjectURL уже освобождённого blob-URL (см. находку). Дальше
+        // error у этого <img> может быть только от такой выгрузки, не от
+        // чтения файла — снимаем обработчик, как только файл прочитан.
+        img.onerror = null;
+        resolve({ kind: 'image', img, url: ownsUrl ? url : null, name, natDur: Infinity, w: img.naturalWidth, h: img.naturalHeight, ready: true });
+      };
+      img.src = url;
+    } else {
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+      if (seekId != null) attachSeekLatch(seekId, v);
+      v.addEventListener('error', fail, { once: true });
+      v.addEventListener('loadedmetadata', () => {
+        const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+        if (!nat) return fail();
+        resolve({ kind: 'video', video: v, url: ownsUrl ? url : null, name, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true });
+      }, { once: true });
+    }
+  });
+}
+
+/* Каждое видео живёт в своём <video>. Клипы кладём встык в конец дорожки,
+   чтобы добавление нескольких файлов сразу давало смонтированный ряд. id —
+   он же srcId пул-записи и src клипа (см. makePool/store выше) — сам файл
+   уходит в IndexedDB, чтобы после перезагрузки его нашла restoreMedia().  */
+function addVideoFile(file, atEnd) {
+  if (!file) return Promise.resolve(null);
+  const id = newMediaId();
+  const url = URL.createObjectURL(file);
+  return makePool('video', url, file.name, true, id).then(entry => {
+    if (!entry) {
+      toast(`Не читается: ${file.name} — попробуй mp4/H.264 или webm`);
+      return null;
+    }
+    entry.srcId = id;
+    mediaPool[id] = entry;
+    S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: Math.round(entry.natDur * 100) / 100, inPoint: 0, src: id });
+    hasVideo = true;
+    idbPut({ src: id, name: file.name, type: file.type, blob: file });
+    return id;
   });
 }
 
@@ -2241,32 +2364,20 @@ function addVideoFile(file, atEnd) {
    как видео тянется за исходник (правая ручка ничем не ограничена — см.
    D.4 в pointermove выше, там граница берётся из соседей/D, а не из natDur). */
 function addImageFile(file, atEnd) {
-  return new Promise(resolve => {
-    if (!file) return resolve(null);
-    const id = newMediaId();
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    const fail = () => {
-      URL.revokeObjectURL(url);
+  if (!file) return Promise.resolve(null);
+  const id = newMediaId();
+  const url = URL.createObjectURL(file);
+  return makePool('image', url, file.name, true).then(entry => {
+    if (!entry) {
       toast(`Не читается: ${file.name} — попробуй jpg/png/webp`);
-      resolve(null);
-    };
-    img.onerror = fail;
-    img.onload = () => {
-      if (!img.naturalWidth || !img.naturalHeight) return fail();
-      // Выгрузка (gcPool/clearVideo) освобождает фото через img.src = '' —
-      // это штатно бьёт по 'error', и если onerror всё ещё висит, следом за
-      // успешным удалением вылезал бы ложный тост «Не читается» да ещё и
-      // повторный revokeObjectURL уже освобождённого blob-URL (см. находку).
-      // Дальше error у этого <img> может быть только от такой выгрузки, не
-      // от чтения файла — снимаем обработчик, как только файл прочитан.
-      img.onerror = null;
-      mediaPool[id] = { kind: 'image', img, url, name: file.name, natDur: Infinity, w: img.naturalWidth, h: img.naturalHeight, ready: true };
-      S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: 3, inPoint: 0 });
-      hasVideo = true;
-      resolve(id);
-    };
-    img.src = url;
+      return null;
+    }
+    entry.srcId = id;
+    mediaPool[id] = entry;
+    S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: 3, inPoint: 0, src: id });
+    hasVideo = true;
+    idbPut({ src: id, name: file.name, type: file.type, blob: file });
+    return id;
   });
 }
 
@@ -2299,20 +2410,22 @@ function loadVideoUrl(url) {
   const id = newMediaId();
   const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
   const wasEmpty = !S.media.length;
-  const v = document.createElement('video');
-  v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
-  attachSeekLatch(id, v);
-  v.addEventListener('loadedmetadata', () => {
-    const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
-    if (!nat) return;
+  // url чужой (например /demo.mp4 из query ?video=) — не наш blob, ownsUrl:false
+  // (как и раньше, revokeObjectURL по нему не делаем, см. makePool). В
+  // IndexedDB кладём саму url-ссылку, а не файл — restoreMedia() её же и
+  // подставит обратно (см. A.1/A.3 в брифе).
+  makePool('video', url, url, false, id).then(entry => {
+    if (!entry) return;
     pushHist(preSnap);
-    mediaPool[id] = { kind: 'video', video: v, url: null, name: url, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
-    S.media.push({ id, name: url, t0: mediaDur(), dur: Math.round(nat * 100) / 100, inPoint: 0 });
+    entry.srcId = id;
+    mediaPool[id] = entry;
+    S.media.push({ id, name: url, t0: mediaDur(), dur: Math.round(entry.natDur * 100) / 100, inPoint: 0, src: id });
     hasVideo = true;
     S.selMedia = id;
+    idbPut({ src: id, name: url, url });
     if (wasEmpty || !S.tl.pps) fitZoom();
     updateVideoMeta(); renderTimeline(); scheduleStrip(); setPlaying(true);
-  }, { once: true });
+  });
 }
 
 /* ================================================= undo/redo ============ */
@@ -2375,13 +2488,19 @@ function redo() {
    не пустую запись, и <video>/blob-URL для него не выгружаются заранее.
    После split два id могут указывать на один и тот же объект {video,url,…}
    — сравниваем по ссылке на объект, а не по id, чтобы не выгрузить видео,
-   которое всё ещё нужно другой половине клипа.                            */
+   которое всё ещё нужно другой половине клипа. Та же логика живости — для
+   src в IndexedDB (см. A.1 в брифе): пока хоть один живой id (в S.media или
+   в истории) ссылается на этот src, файл в базе не трогаем.               */
 function gcPool() {
   const liveIds = new Set(S.media.map(m => m.id));
+  const liveSrcs = new Set(S.media.map(m => m.src).filter(Boolean));
   for (const s of [...hist.undo, ...hist.redo]) {
     try {
       const o = JSON.parse(s);
-      if (Array.isArray(o.media)) for (const m of o.media) liveIds.add(m.id);
+      if (Array.isArray(o.media)) for (const m of o.media) {
+        liveIds.add(m.id);
+        if (m.src) liveSrcs.add(m.src);
+      }
     } catch (_) {}
   }
   const liveObjs = new Set();
@@ -2401,6 +2520,7 @@ function gcPool() {
         }
         if (p.url) URL.revokeObjectURL(p.url);
       } catch (_) {}
+      if (p.srcId && !liveSrcs.has(p.srcId)) idbDelete(p.srcId);
     }
     delete mediaPool[id];
   }
@@ -2431,6 +2551,7 @@ function splitMediaAt(t = clock) {
     t0: Math.round(t * 100) / 100,
     dur: Math.round((oldEnd - t) * 100) / 100,
     inPoint: Math.round(((m.inPoint || 0) + (t - m.t0)) * 100) / 100,
+    src: m.src,   // тот же файл, что у левой половины — см. mediaPool[rightId] ниже
   };
   m.dur = Math.round((t - m.t0) * 100) / 100;
   S.media.splice(S.media.indexOf(m) + 1, 0, right);
@@ -2539,7 +2660,7 @@ function deleteMedia(id) {
 }
 
 function clearVideo() {
-  if (!S.media.length) { toast('Видео или фото нет'); return; }
+  if (!S.media.length) { toast('Видео и фото нет'); return; }
   setPlaying(false);
   hist.undo = []; hist.redo = [];   // не отменяется — история чистится вместе с пулом
   updateHistButtons();
@@ -2561,11 +2682,12 @@ function clearVideo() {
   S.media = []; S.trans = [];
   S.selMedia = null; S.selTrans = null;
   hasVideo = false;
+  idbClear();   // сами файлы тоже стёрты — держать их в IndexedDB дальше незачем (см. A в брифе)
   fitZoom();   // видео пропало — масштаб таймлайна должен снова влезать в оставшийся контент
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   seekTo(0);
   $('#tlwrap').scrollLeft = 0;
-  toast('Видео и фото убраны');
+  toast('Все видео и фото убраны');
 }
 
 function selectMedia(id) {
@@ -2692,7 +2814,7 @@ function updateVideoMeta() {
     return;
   }
 
-  if (!S.media.length) { el.textContent = 'Видео или фото нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
+  if (!S.media.length) { el.textContent = 'Видео и фото нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
   const cur = getMedia(S.selMedia) || sortedMedia()[0];
   const p = mediaPool[cur.id];
   const isPhoto = mediaKind(cur) === 'image';
@@ -2733,22 +2855,17 @@ $('#fileBg').addEventListener('change', e => {
 ['dragleave', 'drop'].forEach(ev => window.addEventListener(ev, e => {
   e.preventDefault(); $('#drop').classList.remove('over');
 }));
-// Если в дропе есть хоть одно видео — это монтаж, всё (включая любые фото
-// среди тех же файлов) идёт на дорожку через addVideoFiles (сама фильтрует
-// и роутит по типу — см. её определение). Один-единственный файл-картинка
-// без единого видео — старое поведение «перетащи фон сюда» (было до того,
-// как фото научились класть на дорожку, см. находку) — отдельный выбор
-// файла #fileBg в панели «6 · Фон» этому не мешает, туда роняют только явно.
+// Всё, что уронили в окно — видео и/или фото, — идёт на дорожку через
+// addVideoFiles (сама фильтрует и роутит по типу — см. её определение).
+// Раньше единственная картинка без единого видео уходила в фон сцены
+// (старое поведение «перетащи фон сюда») — с тех пор, как фото научились
+// класть на дорожку, эта ветка только путала (см. C в брифе): фото на
+// дорожке теперь предсказуемо всегда фото на дорожке. Фон по-прежнему
+// загружается только явно, через выбор файла #fileBg в панели «6 · Фон» —
+// этот дроп его не трогает.
 window.addEventListener('drop', e => {
   const files = [...(e.dataTransfer.files || [])];
   if (!files.length) return;
-  const hasVid = files.some(f => f.type.startsWith('video/'));
-  if (!hasVid && files.length === 1 && files[0].type.startsWith('image/')) {
-    const img = new Image();
-    img.onload = () => { bgImage = img; S.bg.type = 'image'; $('#bgType').value = 'image'; save(); toast('Фон загружен'); };
-    img.src = URL.createObjectURL(files[0]);
-    return;
-  }
   addVideoFiles(files);
 });
 
@@ -3001,6 +3118,11 @@ function setZoom(pps, anchorT) {
    решаем численно (бисекция по contentW(pps) <= viewW), иначе после fitZoom
    полоса прокрутки всё равно остаётся (см. AC-Z2 в брифе).                */
 function fitZoom() {
+  // В фоновой вкладке ширины ещё нет (clientWidth 0, tlViewW() отдаёт
+  // заглушку 50) — масштаб от неё был бы мусорным и, что хуже, сохранился бы.
+  // Оставляем pps=0: layoutTimeline() подберёт его сам при resize/появлении
+  // вкладки (см. проверку clientWidth > 120 там).
+  if ($('#tlwrap').clientWidth <= 120) { S.tl.pps = 0; return; }
   const wrap = $('#tlwrap');
   // contentW() сам содержит max(viewW, …) — раз он никогда не бывает МЕНЬШЕ
   // viewW, целиться нужно ровно в viewW (+0.5 запаса на плавающую точку), а
@@ -4545,9 +4667,32 @@ function load() {
     if (!FRAMES[S.frame]) S.frame = 'black';
     if (DEVICES[S.device] && !deviceColors(DEVICES[S.device]).includes(S.frame)) S.frame = deviceColors(DEVICES[S.device])[0];
     if (S.bg.type === 'image') S.bg.type = 'linear';   // картинку заново не восстановить
-    S.media = [];  S.selMedia = null;      // blob-ссылки не переживают перезагрузку
-    S.tl.pps = 0;   // масштаб имеет смысл только относительно видео, а его после перезагрузки нет — подберётся заново
-    S.trans = []; S.selTrans = null;       // переходы висят на медиа-клипах, тоже не переживают
+    // Сами File/Blob в localStorage не лезут (тут только JSON S, см. save())
+    // — они лежат в IndexedDB и возвращаются в mediaPool в restoreMedia()
+    // (см. A/B в брифе), а тут только валидируем то, что вообще могло тут
+    // сохраниться раньше: числа не NaN/±Infinity, длительность положительная,
+    // и у клипа обязательно есть src — без него файл в IndexedDB не найти
+    // (например старый сейв ещё до этого поля), такой клип безнадёжен.
+    if (!Array.isArray(S.media)) S.media = [];
+    S.media = S.media.filter(m => m && typeof m.id === 'string' && typeof m.src === 'string' && m.src &&
+      isFinite(m.t0) && m.t0 >= 0 && isFinite(m.dur) && m.dur > 0);
+    for (const m of S.media) {
+      if (!isFinite(m.inPoint)) m.inPoint = 0;
+      // newMediaId() продолжает нумерацию с этого сейва — иначе первый же
+      // addVideoFile после перезагрузки получит id, который уже занят
+      // восстановленным клипом (mediaSeq — отдельная переменная, в S не
+      // живёт, см. её объявление), как уже сделано для сцен/наездов ниже.
+      const n = +String(m.id).replace(/\D/g, ''); if (isFinite(n) && n >= mediaSeq) mediaSeq = n + 1;
+    }
+    if (S.selMedia && !S.media.some(m => m.id === S.selMedia)) S.selMedia = null;
+    S.tl.pps = 0;   // масштаб имеет смысл относительно реальной длины дорожки — подберётся в restoreMedia() (fitZoom)
+    if (!Array.isArray(S.trans)) S.trans = [];
+    S.trans = S.trans.filter(tr => tr && typeof tr.id === 'string' && (tr.edge === 'in' || tr.edge === 'out') &&
+      isFinite(tr.dur) && tr.dur > 0 && S.media.some(m => m.id === tr.clip));
+    for (const tr of S.trans) {
+      const n = +String(tr.id).replace(/\D/g, ''); if (isFinite(n) && n >= transSeq) transSeq = n + 1;
+    }
+    if (S.selTrans && !S.trans.some(tr => tr.id === S.selTrans)) S.selTrans = null;
     if (!Array.isArray(S.scenes)) S.scenes = [];
     S.scenes = S.scenes.filter(b => b && SCENARIOS.some(x => x.id === b.sc && x.dur > 0) && isFinite(b.t0) && b.dur > 0);
     for (const b of S.scenes) {
@@ -4573,6 +4718,116 @@ function load() {
   } catch (_) {}
 }
 
+/* Восстановление медиа после перезагрузки (см. A/B в брифе). Сами File/Blob
+   не переживают localStorage — там только JSON S (см. save()) — а лежат в
+   IndexedDB по ключу src (см. idbPut/makePool выше). Один src может
+   понадобиться нескольким клипам сразу — после split несколько S.media-
+   записей смотрят на один и тот же файл (см. splitMediaAt) — поэтому грузим
+   каждый src ровно один раз и раздаём получившуюся pool-запись всем клипам
+   с этим src: та же схема «общий объект под разными id», что и у самого
+   split. Вызывается из init() уже после renderTimeline() — клипы на дорожке
+   видны сразу (load() больше не обнуляет S.media), а пока эта функция не
+   отработала, mediaPool для них ещё пуст: mediaAt()/activeMedia() в этот
+   момент отдают null, draw() рисует заглушку — это ожидаемо и временно
+   (см. B.2 в брифе). История (hist.undo/redo) после перезагрузки всегда
+   пустая — так было и раньше, отдельно её тут восстанавливать незачем.    */
+async function restoreMedia() {
+  const srcs = [...new Set(S.media.map(m => m.src))];
+  // Снимок id, которые нужно восстановить именно нам. Пока идут await ниже
+  // (чтение из IndexedDB, loadedmetadata видео), пользователь может успеть
+  // сам добавить клип через drop/#file (addVideoFiles/addImageFile) — тот
+  // синхронно получает свою pool-запись и попадает в S.media под id,
+  // которого тут не было. Без origIds финальный filter ниже не находил бы
+  // его в своей карте entries (она собрана только из srcs на момент старта)
+  // и молча вырезал бы этот клип с дорожки — а идущая следом чистка сирот
+  // так же молча удаляла бы его файл из IndexedDB (см. находку о гонке).
+  const origIds = new Set(S.media.map(m => m.id));
+  const entries = new Map();   // src → готовая pool-запись, либо null — файл не нашёлся/не читается
+  await Promise.all(srcs.map(async src => {
+    let entry = null;
+    try {
+      const rec = await idbGet(src);
+      if (rec && rec.blob) {
+        const url = URL.createObjectURL(rec.blob);
+        const kind = rec.type && rec.type.startsWith('image/') ? 'image' : 'video';
+        entry = await makePool(kind, url, rec.name, true, src);
+      } else if (rec && rec.url) {
+        entry = await makePool('video', rec.url, rec.name, false, src);
+      }
+    } catch (_) { entry = null; }
+    if (entry) entry.srcId = src;
+    entries.set(src, entry);
+  }));
+
+  const missing = [];
+  S.media = S.media.filter(m => {
+    if (!origIds.has(m.id)) return true;   // добавлен параллельно, пока мы ждали выше, — не наш, не трогаем
+    const entry = entries.get(m.src);
+    if (!entry) { missing.push(m); return false; }
+    mediaPool[m.id] = entry;
+    return true;
+  });
+  if (missing.length) {
+    const missIds = new Set(missing.map(m => m.id));
+    S.trans = S.trans.filter(tr => !missIds.has(tr.clip));
+    if (S.selMedia && missIds.has(S.selMedia)) S.selMedia = null;
+  }
+
+  // Осиротевшие записи IndexedDB (см. A.3 в брифе): src, которые не нужны ни
+  // одному клипу — ни восстановленному нами (srcs), ни добавленному
+  // параллельно, пока мы ждали выше (текущий S.media — см. находку о
+  // гонке, тот же приём, что и с origIds). Из прошлой сессии их мог держать
+  // живыми только undo/redo (см. gcPool) — а история после перезагрузки
+  // страницы всегда пустая, значит и держать их больше некому. Раньше это
+  // условие ошибочно пряталось за `if (!S.media.length) return` в начале
+  // функции — при пустой дорожке (последний клип убрали и перезагрузили
+  // страницу, либо клип отбросило при load() ещё до этой функции) чистка
+  // не запускалась вовсе, и такой файл (у пользователя — десятки/сотни МБ)
+  // оставался в IndexedDB навсегда, а освободить его через интерфейс
+  // нечем — «Убрать всё видео и фото» на пустой дорожке сама выходит
+  // раньше idbClear() (см. clearVideo, находку о том же).
+  // Гонять эту чистку смысл есть, только если в этом браузере вообще могло
+  // что-то накопиться в IndexedDB: либо сейчас есть что восстанавливать
+  // (srcs.length), либо localStorage уже хранит сейв с прошлого раза (KEY
+  // мог остаться и после того, как медиа из него отфильтровали при load()
+  // — см. её код, там же пример с клипом без src). На самом первом визите
+  // ни того ни другого нет — IndexedDB гарантированно пуста, а лишний
+  // idbKeys()/idbOpen() на браузере без поддержки IndexedDB — это только
+  // спутывающий тост про «не удалось сохранить файл» (см. idbWarn) там, где
+  // пользователь ещё вообще ничего не сохранял.
+  let hadPrevSave = true;
+  try { hadPrevSave = localStorage.getItem(KEY) != null; } catch (_) {}
+  if (srcs.length || hadPrevSave) {
+    idbKeys().then(keys => {
+      const live = new Set([...srcs, ...S.media.map(m => m.src)]);
+      for (const k of keys) if (!live.has(k)) idbDelete(k);
+    });
+  }
+
+  hasVideo = S.media.some(m => mediaPool[m.id]);
+  updateVideoMeta();
+  renderTimeline();
+  scheduleStrip();
+  // Как при самом первом появлении медиа (см. addVideoFiles) — масштаб
+  // таймлайна ещё не подобран под реальную длину восстановленной дорожки.
+  fitZoom();
+  // toast() однослотовый (см. его код) — несколько вызовов подряд в одном
+  // синхронном блоке (как раньше: тост на каждый пропавший файл, а следом
+  // ещё и «Проект восстановлен») показывают пользователю только самый
+  // последний, отрисовки между ними не происходит (см. находку). Поэтому
+  // здесь ровно один вызов: если что-то потерялось — сообщаем про это (и
+  // не показываем следом бодрое «восстановлен», лишь бы не перетереть),
+  // иначе — обычный итог восстановления.
+  if (missing.length) {
+    const names = missing.map(m => m.name).join(', ');
+    toast(missing.length > 1
+      ? `Не найдены файлы: ${names} — клипы убраны`
+      : `Не найден файл: ${names} — клип убран`);
+  } else if (S.media.length) {
+    toast(`Проект восстановлен: ${S.media.length} клипов`);
+  }
+}
+
 /* ================================================= старт =============== */
 
 function init() {
@@ -4585,6 +4840,7 @@ function init() {
   updateVideoMeta();
   renderTimeline();
   updateHistButtons();
+  restoreMedia();   // асинхронно — клипы уже видны на дорожке, файлы дотягиваются из IndexedDB (см. бриф)
 
   const q = new URLSearchParams(location.search);
   if (q.get('video')) loadVideoUrl(q.get('video'));
@@ -4599,6 +4855,7 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   addScaleClip, clipKind,
   addVideoFiles, addImageFile, deleteMedia, clearVideo, mediaDur, mediaAt, activeMedia, mediaKind,
   syncMedia, mediaPool, holdHead, holdTail, stats,
+  restoreMedia, idb: { get: idbGet, keys: idbKeys, del: idbDelete, clear: idbClear },
   addScene, applyReel, deleteScene, sceneFade, sceneAt,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
