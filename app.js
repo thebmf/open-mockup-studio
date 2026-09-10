@@ -412,13 +412,16 @@ const ctx = canvas.getContext('2d', { alpha: true, desynchronized: true });
 const video = $('#v');
 
 let bgImage = null;         // Image для фонового изображения
-/* Несколько видео на дорожке: у каждого свой <video>. Сам элемент в S не
-   хранится — только запись клипа; blob-ссылки не переживают перезагрузку,
-   поэтому при восстановлении состояния клипы без источника отбрасываются.  */
-const mediaPool = {};            // id → {video, url, name, natDur, w, h, ready}
+/* Несколько видео/фото на дорожке: у каждого своя запись в пуле — видео
+   держит <video> (kind:'video'), фото — <img> (kind:'image', natDur:Infinity,
+   без звука). Сам элемент в S не хранится — только запись клипа; blob-ссылки
+   не переживают перезагрузку, поэтому при восстановлении состояния клипы без
+   источника отбрасываются.                                                */
+const mediaPool = {};            // id → {kind, video|img, url, name, natDur, w, h, ready, frame?, frameTime?, pendingSeek?}
 let mediaSeq = 1;
 const newMediaId = () => 'm' + (mediaSeq++);
-let hasVideo = false;            // есть хотя бы одно готовое видео
+let hasVideo = false;            // есть хотя бы одно готовое медиа (видео или фото)
+const stats = { seeks: 0 };      // счётчик реальных назначений video.currentTime — для отладки скраба
 
 /* Переходы — просто уход в чёрное, без собственного медиа-содержимого,
    поэтому им не нужен pool. Каждый переход сидит на краю ('in'|'out') одного
@@ -432,14 +435,27 @@ function transOnEdge(clipId, edge) { return S.trans.find(x => x.clip === clipId 
 function mediaEnd(m) { return m.t0 + m.dur; }
 function sortedMedia() { return S.media.slice().sort((a, b) => a.t0 - b.t0); }
 function getMedia(id) { return S.media.find(m => m.id === id) || null; }
+/* Вид клипа берём из пула, а не храним в самом клипе — так split/undo не
+   должны его туда-сюда копировать: у обеих половин split один и тот же pool
+   объект, значит и один и тот же kind автоматически. Пока pool ещё не готов
+   (только что добавили файл), считаем клип видео — это временное состояние
+   до loadedmetadata/onload.                                               */
+function mediaKind(m) { return (mediaPool[m.id] || {}).kind || 'video'; }
 /* Стоп-кадр (см. бриф «Стоп-кадр»): клип можно тянуть за край дальше, чем
    реально снято в исходнике — тогда inPoint уходит в минус (заморозка у
    начала) или dur уходит за (natDur − inPoint) (заморозка у конца). Обе
    функции возвращают, сколько «виртуальных» секунд с этого края клипа —
    застывший крайний кадр, а не настоящее видео; 0, когда края не выходят
-   за исходник или pool ещё не готов (natDur неизвестен).                  */
-function holdHead(m) { return Math.max(0, Math.min(m.dur, -(m.inPoint || 0))); }
+   за исходник или pool ещё не готов (natDur неизвестен). У фото natDur
+   бесконечен и кадр всегда один и тот же — стоп-кадра как понятия для него
+   просто нет, поэтому обе функции сразу отдают 0, не считая формулу (при
+   отрицательном inPoint от левой ручки формула дала бы ненулевое число).  */
+function holdHead(m) {
+  if (mediaKind(m) === 'image') return 0;
+  return Math.max(0, Math.min(m.dur, -(m.inPoint || 0)));
+}
 function holdTail(m) {
+  if (mediaKind(m) === 'image') return 0;
   const p = mediaPool[m.id];
   if (!p) return 0;
   return Math.max(0, Math.min(m.dur, m.dur - (p.natDur - (m.inPoint || 0))));
@@ -468,7 +484,37 @@ function mediaAt(t) {
   }
   return null;
 }
-function activeVideo(t) { const a = mediaAt(t); return a ? a.pool.video : null; }
+/* Только видео — null и для пустой сцены, и для активного клипа-фото. */
+function activeVideo(t) { const a = mediaAt(t); return (a && a.pool.video) ? a.pool.video : null; }
+
+/* Что сейчас рисовать на экране телефона: активный клип, приведённый к
+   {kind, el, w, h} независимо от того, видео это, фото или живой кадр видео
+   подменён последним снятым слепком (см. syncMedia/p.frame — брифинг,
+   «Живой скраб»). null — только когда на плейхеде вообще нет клипа; в
+   отличие от него, «кадр ещё не готов» (видео есть, но ни живого readyState,
+   ни p.frame) — это тоже null, но временно, на следующий тик обычно найдётся
+   хоть что-то. Placeholder рисуется только в самом первом случае.         */
+function activeMedia(t) {
+  const a = mediaAt(t);
+  if (!a) return null;
+  const p = a.pool;
+  if (p.kind === 'image') return { kind: 'image', el: p.img, w: p.w, h: p.h };
+  const v = p.video;
+  if (v.readyState >= 2 && !v.seeking && v.videoWidth) return { kind: 'video', el: v, w: v.videoWidth, h: v.videoHeight };
+  if (p.frame) return { kind: 'frame', el: p.frame, w: p.frame.width, h: p.frame.height };
+  return null;
+}
+
+/* Снимок последнего валидного кадра видео — на offscreen-канвас в пуле.
+   Вызывается только на перемотку (см. syncMedia), не на каждый кадр
+   воспроизведения — иначе это была бы лишняя копия по вх кадру.          */
+function snapshotFrame(p, v) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) return;
+  if (!p.frame) p.frame = document.createElement('canvas');
+  if (p.frame.width !== vw || p.frame.height !== vh) { p.frame.width = vw; p.frame.height = vh; }
+  try { p.frame.getContext('2d').drawImage(v, 0, 0, vw, vh); p.frameTime = v.currentTime; } catch (_) {}
+}
 
 /* Ставим активному клипу нужное время. Клок — ведущий: догонять его текущим
    временем видео нельзя, между клипами и в разрывах видео просто нет.
@@ -477,11 +523,34 @@ function syncMedia(t, wantPlay) {
   const a = mediaAt(t);
   for (const id in mediaPool) {
     const p = mediaPool[id];
-    if (!p.ready) continue;
+    if (!p.ready || !p.video) continue;    // фото паузить нечего
     if (!a || p !== a.pool) { if (!p.video.paused) p.video.pause(); }
   }
   if (!a) return;
-  const v = a.pool.video, edge = Math.max(0, a.pool.natDur - 0.03);
+  if (a.pool.kind === 'image') return;     // фото рисуется всегда одинаково — синкать нечего
+  const v = a.pool.video, p = a.pool, edge = Math.max(0, p.natDur - 0.03);
+
+  // Перемотка «последний позвал — тот и победил»: если видео уже в процессе
+  // предыдущего seek(), второй currentTime= браузер либо проигнорирует, либо
+  // поставит в очередь непредсказуемо — вместо этого запоминаем желаемое
+  // время и досылаем его на событии 'seeked' (слушатель — в addVideoFile/
+  // loadVideoUrl), когда предыдущая перемотка гарантированно завершилась.
+  // Снимок кадра — здесь, а не безусловно на каждый вызов syncMedia: снимаем
+  // ДО того, как потрогаем currentTime (перемотка почти всегда на миг роняет
+  // readyState ниже 2, и без этого снимка drawScreenContent на этот миг
+  // откатился бы к заглушке вместо картинки видео — см. «Живой скраб» в
+  // брифинге), но именно тогда, когда мы вот-вот реально позовём seek, а не
+  // на каждом кадре воспроизведения/записи — иначе это лишняя полноразмерная
+  // копия видео в канвас на КАЖДЫЙ кадр рендера (см. находку по snapshotFrame:
+  // ~10× по времени кадра, ниже 60fps в обычном сценарии «нажал play»).
+  // Снимаем только когда кадр валиден и не в процессе уже идущей перемотки,
+  // иначе рискуем закэшировать смазанный кадр.
+  const seekTo_ = (want) => {
+    if (v.readyState >= 2 && !v.seeking) snapshotFrame(p, v);
+    if (v.seeking) { p.pendingSeek = want; return; }
+    try { v.currentTime = want; stats.seeks++; } catch (_) {}
+  };
+
   // Стоп-кадр: local вне [0, natDur) — клип растянут дальше исходника, и
   // этот край сейчас должен показывать застывший крайний кадр, а не живое
   // видео. Держим currentTime у самого края и ставим на паузу НЕЗАВИСИМО
@@ -494,14 +563,18 @@ function syncMedia(t, wantPlay) {
   // даже небольшой снос уже заметен и не требует «гасить» дрожание.
   if (a.local < 0 || a.local >= edge) {
     const want = a.local < 0 ? 0 : edge;
-    if (Math.abs(v.currentTime - want) > 0.05) { try { v.currentTime = want; } catch (_) {} }
+    if (Math.abs(v.currentTime - want) > 0.05) seekTo_(want);
     if (!v.paused) v.pause();
     return;
   }
   const want = clamp(a.local, 0, edge);
-  if (Math.abs(v.currentTime - want) > 0.2 || v.seeking === undefined) {
-    try { v.currentTime = want; } catch (_) {}
-  }
+  // На паузе (в том числе во время скраба — там wantPlay=false) держим
+  // кадр точнее: порог ниже, чем во время воспроизведения (0.04 вместо
+  // 0.2), иначе видно, что плейхед и картинка на экране разъехались на
+  // заметную долю секунды. При игре порог оставляем широким — иначе рвётся
+  // плавность мелким дрожанием от одного лишь дрейфа между clock и currentTime.
+  const thresh = wantPlay ? 0.2 : 0.04;
+  if (Math.abs(v.currentTime - want) > thresh || v.seeking === undefined) seekTo_(want);
   if (wantPlay) { if (v.paused) v.play().catch(() => {}); }
   else if (!v.paused) v.pause();
 }
@@ -696,23 +769,22 @@ function drawScreenContent(g, x, y, w, h) {
   g.fillStyle = S.screen.bg;
   g.fillRect(x, y, w, h);
 
-  const av = activeVideo(drawTime);
-  if (av && av.readyState >= 2 && av.videoWidth) {
-    const video = av;
-    const vw = video.videoWidth, vh = video.videoHeight;
-    let dw, dh;
-    if (S.screen.fit === 'stretch') { dw = w; dh = h; }
-    else {
-      const k = S.screen.fit === 'contain' ? Math.min(w / vw, h / vh) : Math.max(w / vw, h / vh);
-      dw = vw * k; dh = vh * k;
-    }
-    dw *= S.screen.zoom; dh *= S.screen.zoom;
-    const dx = x + (w - dw) / 2 + S.screen.offX * w;
-    const dy = y + (h - dh) / 2 + S.screen.offY * h;
-    try { g.drawImage(video, dx, dy, dw, dh); } catch (e) { /* кадр ещё не готов */ }
-  } else {
-    drawPlaceholder(g, x, y, w, h);
+  // activeMedia уже сам решает видео/фото/застывший кадр (см. функцию выше) —
+  // заглушка рисуется только когда на плейхеде вообще нет активного клипа,
+  // а не всякий раз, когда видео на миг теряет readyState во время скраба.
+  const am = activeMedia(drawTime);
+  if (!am) { drawPlaceholder(g, x, y, w, h); return; }
+  const vw = am.w, vh = am.h;
+  let dw, dh;
+  if (S.screen.fit === 'stretch') { dw = w; dh = h; }
+  else {
+    const k = S.screen.fit === 'contain' ? Math.min(w / vw, h / vh) : Math.max(w / vw, h / vh);
+    dw = vw * k; dh = vh * k;
   }
+  dw *= S.screen.zoom; dh *= S.screen.zoom;
+  const dx = x + (w - dw) / 2 + S.screen.offX * w;
+  const dy = y + (h - dh) / 2 + S.screen.offY * h;
+  try { g.drawImage(am.el, dx, dy, dw, dh); } catch (e) { /* кадр ещё не готов */ }
 }
 
 /* Демо-экран, пока видео не загружено — чтобы сразу было видно композицию. */
@@ -1722,9 +1794,17 @@ function screenAvgColor() {
   if ((avgTick++ % 6) !== 0) return avgColor;
   try {
     const g = avgCv.getContext('2d', { willReadFrequently: true });
-    const av = activeVideo(drawTime);
-    if (av && av.readyState >= 2) g.drawImage(av, 0, 0, 4, 4);
-    else { g.fillStyle = '#1a2040'; g.fillRect(0, 0, 4, 4); }
+    const a = mediaAt(drawTime);
+    if (!a) { g.fillStyle = '#1a2040'; g.fillRect(0, 0, 4, 4); }
+    else {
+      // То же «видео / фото / застывший кадр», что и в drawScreenContent.
+      // Если прямо сейчас ничего из этого не готово (редкий миг посреди
+      // скраба) — просто не трогаем цвет в этот тик, а не подсовываем
+      // мимолётную черноту в засветку рамки.
+      const am = activeMedia(drawTime);
+      if (!am) return avgColor;
+      g.drawImage(am.el, 0, 0, 4, 4);
+    }
     const d = g.getImageData(0, 0, 4, 4).data;
     let r = 0, gg = 0, b = 0;
     for (let i = 0; i < d.length; i += 4) { r += d[i]; gg += d[i + 1]; b += d[i + 2]; }
@@ -2104,6 +2184,30 @@ if (window.ResizeObserver) new ResizeObserver(es => {
 
 /* ================================================= загрузка медиа ======= */
 
+/* Слушатель 'seeked' вешается на <video> один раз, сразу при создании
+   элемента (и тут, и в loadVideoUrl) — досылает отложенную «последний
+   позвал — тот и победил» перемотку из syncMedia, когда предыдущий seek()
+   гарантированно завершился (см. p.pendingSeek там же).                   */
+function attachSeekLatch(id, v) {
+  v.addEventListener('seeked', () => {
+    // split() отдаёт обе половины на одну pool-запись под разными id
+    // (mediaPool[rightId] = mediaPool[m.id], см. splitMediaAt) — если id,
+    // на который замкнулся этот листенер, потом вычищается из пула
+    // (удалили эту половину, а снимок с её id вытеснился из истории —
+    // gcPool), запись всё ещё жива под другим ключом. Без запасного поиска
+    // по ссылке на само видео латч тут молча зависал бы навсегда (см.
+    // находку) — pendingSeek выставлен на тот же объект, просто по id его
+    // больше не найти.
+    const p = mediaPool[id] || Object.values(mediaPool).find(x => x.video === v);
+    if (!p || p.pendingSeek == null) return;
+    const want = p.pendingSeek;
+    p.pendingSeek = null;
+    if (Math.abs(v.currentTime - want) > 0.04) {
+      try { v.currentTime = want; stats.seeks++; } catch (_) {}
+    }
+  });
+}
+
 /* Каждое видео живёт в своём <video>. Клипы кладём встык в конец дорожки,
    чтобы добавление нескольких файлов сразу давало смонтированный ряд.      */
 function addVideoFile(file, atEnd) {
@@ -2113,6 +2217,7 @@ function addVideoFile(file, atEnd) {
     const url = URL.createObjectURL(file);
     const v = document.createElement('video');
     v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+    attachSeekLatch(id, v);
     const fail = () => {
       URL.revokeObjectURL(url);
       toast(`Не читается: ${file.name} — попробуй mp4/H.264 или webm`);
@@ -2122,7 +2227,7 @@ function addVideoFile(file, atEnd) {
     v.addEventListener('loadedmetadata', () => {
       const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
       if (!nat) return fail();
-      mediaPool[id] = { video: v, url, name: file.name, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
+      mediaPool[id] = { kind: 'video', video: v, url, name: file.name, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
       S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: Math.round(nat * 100) / 100, inPoint: 0 });
       hasVideo = true;
       resolve(id);
@@ -2130,28 +2235,63 @@ function addVideoFile(file, atEnd) {
   });
 }
 
+/* Фото живёт как <img> на blob-URL — своя запись в пуле с kind:'image' и
+   natDur:Infinity (стоп-кадра как понятия для фото нет, см. holdHead/
+   holdTail), клип по умолчанию 3 с и дальше тянется на любую длину так же,
+   как видео тянется за исходник (правая ручка ничем не ограничена — см.
+   D.4 в pointermove выше, там граница берётся из соседей/D, а не из natDur). */
+function addImageFile(file, atEnd) {
+  return new Promise(resolve => {
+    if (!file) return resolve(null);
+    const id = newMediaId();
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    const fail = () => {
+      URL.revokeObjectURL(url);
+      toast(`Не читается: ${file.name} — попробуй jpg/png/webp`);
+      resolve(null);
+    };
+    img.onerror = fail;
+    img.onload = () => {
+      if (!img.naturalWidth || !img.naturalHeight) return fail();
+      // Выгрузка (gcPool/clearVideo) освобождает фото через img.src = '' —
+      // это штатно бьёт по 'error', и если onerror всё ещё висит, следом за
+      // успешным удалением вылезал бы ложный тост «Не читается» да ещё и
+      // повторный revokeObjectURL уже освобождённого blob-URL (см. находку).
+      // Дальше error у этого <img> может быть только от такой выгрузки, не
+      // от чтения файла — снимаем обработчик, как только файл прочитан.
+      img.onerror = null;
+      mediaPool[id] = { kind: 'image', img, url, name: file.name, natDur: Infinity, w: img.naturalWidth, h: img.naturalHeight, ready: true };
+      S.media.push({ id, name: file.name, t0: Math.round(atEnd * 100) / 100, dur: 3, inPoint: 0 });
+      hasVideo = true;
+      resolve(id);
+    };
+    img.src = url;
+  });
+}
+
 async function addVideoFiles(files) {
-  const list = [...files].filter(f => f.type.startsWith('video/'));
+  const list = [...files].filter(f => f.type.startsWith('video/') || f.type.startsWith('image/'));
   if (!list.length) return;
   const preSnap = snap();     // снимок до добавления — чтобы undo убрал добавленное целиком
   const wasEmpty = !S.media.length;
   let at = mediaDur();
   let added = 0;
   for (const f of list) {
-    const id = await addVideoFile(f, at);
+    const id = f.type.startsWith('image/') ? await addImageFile(f, at) : await addVideoFile(f, at);
     if (id) { at = mediaDur(); added++; }
   }
   if (!added) return;
   pushHist(preSnap);
   S.selMedia = S.media[S.media.length - 1].id;
-  // Первое видео на пустой дорожке — масштаб таймлайна ещё не подобран под
+  // Первое медиа на пустой дорожке — масштаб таймлайна ещё не подобран под
   // реальную длину (или это вообще самый первый рендер), поэтому подгоняем
   // его сразу; дальше зум трогают только явные действия (см. A.5 в брифе).
   if (wasEmpty || !S.tl.pps) fitZoom();
   updateVideoMeta();
   renderTimeline();
   scheduleStrip();
-  if (added === list.length) toast(added > 1 ? `Добавлено видео: ${added}` : 'Видео добавлено');
+  if (added === list.length) toast(added > 1 ? `Добавлено: ${added}` : 'Добавлено');
   save();
 }
 
@@ -2161,11 +2301,12 @@ function loadVideoUrl(url) {
   const wasEmpty = !S.media.length;
   const v = document.createElement('video');
   v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = url;
+  attachSeekLatch(id, v);
   v.addEventListener('loadedmetadata', () => {
     const nat = isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
     if (!nat) return;
     pushHist(preSnap);
-    mediaPool[id] = { video: v, url: null, name: url, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
+    mediaPool[id] = { kind: 'video', video: v, url: null, name: url, natDur: nat, w: v.videoWidth, h: v.videoHeight, ready: true };
     S.media.push({ id, name: url, t0: mediaDur(), dur: Math.round(nat * 100) / 100, inPoint: 0 });
     hasVideo = true;
     S.selMedia = id;
@@ -2250,10 +2391,14 @@ function gcPool() {
     const p = mediaPool[id];
     if (!liveObjs.has(p)) {
       try {
-        p.video.pause();
-        if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
-        p.video.removeAttribute('src');
-        p.video.load();
+        if (p.video) {
+          p.video.pause();
+          if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
+          p.video.removeAttribute('src');
+          p.video.load();
+        } else if (p.img) {
+          p.img.src = '';
+        }
         if (p.url) URL.revokeObjectURL(p.url);
       } catch (_) {}
     }
@@ -2362,6 +2507,7 @@ function deleteMedia(id) {
   pushHist();
   const m = S.media[i];
   const name = m.name, t0 = m.t0, end = mediaEnd(m), dur = m.dur;
+  const isPhoto = mediaKind(m) === 'image';   // для тоста ниже — берём до gcPool(), пока запись точно жива
   S.media.splice(i, 1);
   // Было ли вообще что подтягивать? Если удалённый клип был последним, ripple
   // никого не двигает — тогда плейхед, стоявший на его конце или дальше,
@@ -2389,21 +2535,25 @@ function deleteMedia(id) {
   syncMedia(clock, playing);
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   updatePlayhead();
-  toast(`Видео убрано: ${name.length > 22 ? name.slice(0, 22) + '…' : name}`);
+  toast(`${isPhoto ? 'Фото' : 'Видео'} убрано: ${name.length > 22 ? name.slice(0, 22) + '…' : name}`);
 }
 
 function clearVideo() {
-  if (!S.media.length) { toast('Видео и так нет'); return; }
+  if (!S.media.length) { toast('Видео или фото нет'); return; }
   setPlaying(false);
   hist.undo = []; hist.redo = [];   // не отменяется — история чистится вместе с пулом
   updateHistButtons();
   for (const id of Object.keys(mediaPool)) {
     const p = mediaPool[id];
     try {
-      p.video.pause();
-      if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
-      p.video.removeAttribute('src');
-      p.video.load();
+      if (p.video) {
+        p.video.pause();
+        if (p.srcNode) { try { p.srcNode.disconnect(); } catch (_) {} }
+        p.video.removeAttribute('src');
+        p.video.load();
+      } else if (p.img) {
+        p.img.src = '';
+      }
       if (p.url) URL.revokeObjectURL(p.url);
     } catch (_) {}
     delete mediaPool[id];
@@ -2415,7 +2565,7 @@ function clearVideo() {
   updateVideoMeta(); renderTimeline(); scheduleStrip(); save();
   seekTo(0);
   $('#tlwrap').scrollLeft = 0;
-  toast('Все видео убраны');
+  toast('Видео и фото убраны');
 }
 
 function selectMedia(id) {
@@ -2542,17 +2692,20 @@ function updateVideoMeta() {
     return;
   }
 
-  if (!S.media.length) { el.textContent = 'Видео нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
+  if (!S.media.length) { el.textContent = 'Видео или фото нет — показан демо-экран. Можно выбрать сразу несколько файлов.'; return; }
   const cur = getMedia(S.selMedia) || sortedMedia()[0];
   const p = mediaPool[cur.id];
+  const isPhoto = mediaKind(cur) === 'image';
   // Стоп-кадр: если клип растянут за исходник хоть с одной стороны — отдельная
   // строка в панели, называет только реально присутствующие края (см. D в брифе).
+  // У фото holdHead/holdTail всегда 0 (см. определение) — строка сама не появится.
   const hh = holdHead(cur), ht = holdTail(cur);
   const holdBits = [];
   if (hh > 0.005) holdBits.push(`в начале ${fmtDur(hh)} с`);
   if (ht > 0.005) holdBits.push(`в конце ${fmtDur(ht)} с`);
   const holdLine = holdBits.length ? `<br><span style="color:#8b93a7">Стоп-кадр: ${holdBits.join(', ')}</span>` : '';
   el.innerHTML = `<b style="color:#c6ccdc">${cur.name}</b><br>` +
+    (isPhoto ? 'Фото · ' : '') +
     (p ? `${p.w}×${p.h} · ` : '') + `${cur.t0.toFixed(1)}–${mediaEnd(cur).toFixed(1)} с` +
     (S.media.length > 1 ? `<br><span style="color:#8b93a7">Всего роликов: ${S.media.length}, общая длина ${mediaDur().toFixed(1)} с</span>` : '') +
     holdLine +
@@ -2580,15 +2733,23 @@ $('#fileBg').addEventListener('change', e => {
 ['dragleave', 'drop'].forEach(ev => window.addEventListener(ev, e => {
   e.preventDefault(); $('#drop').classList.remove('over');
 }));
+// Если в дропе есть хоть одно видео — это монтаж, всё (включая любые фото
+// среди тех же файлов) идёт на дорожку через addVideoFiles (сама фильтрует
+// и роутит по типу — см. её определение). Один-единственный файл-картинка
+// без единого видео — старое поведение «перетащи фон сюда» (было до того,
+// как фото научились класть на дорожку, см. находку) — отдельный выбор
+// файла #fileBg в панели «6 · Фон» этому не мешает, туда роняют только явно.
 window.addEventListener('drop', e => {
-  const f = [...(e.dataTransfer.files || [])][0];
-  if (!f) return;
-  if ([...(e.dataTransfer.files || [])].some(x => x.type.startsWith('video/'))) addVideoFiles(e.dataTransfer.files);
-  else if (f.type.startsWith('image/')) {
+  const files = [...(e.dataTransfer.files || [])];
+  if (!files.length) return;
+  const hasVid = files.some(f => f.type.startsWith('video/'));
+  if (!hasVid && files.length === 1 && files[0].type.startsWith('image/')) {
     const img = new Image();
     img.onload = () => { bgImage = img; S.bg.type = 'image'; $('#bgType').value = 'image'; save(); toast('Фон загружен'); };
-    img.src = URL.createObjectURL(f);
+    img.src = URL.createObjectURL(files[0]);
+    return;
   }
+  addVideoFiles(files);
 });
 
 /* ================================================= мышь на холсте ======= */
@@ -3746,6 +3907,20 @@ async function buildFilmstrip() {
     const g = el.getContext('2d');
     g.clearRect(0, 0, el.width, el.height);
 
+    if (p.kind === 'image') {
+      // Фото не меняется во времени — нет смысла перематывать/ждать кадры,
+      // просто кладём картинку в те же n ячеек, что и у видео (тот же расчёт
+      // n ниже, только без похода за отдельным <video> для плёнки).
+      let thumbW = Math.round(el.height * (p.w / Math.max(1, p.h)));
+      thumbW = Math.max(thumbW, Math.ceil(el.width / 12));
+      const n = clamp(Math.ceil(el.width / Math.max(8, thumbW)), 1, 16);
+      for (let i = 0; i < n; i++) g.drawImage(p.img, i * (el.width / n), 0, el.width / n + 1, el.height);
+      if (token === stripToken && $(`#trkVideo .clip.media[data-id="${m.id}"] canvas.thumbs`) === el) {
+        thumbCache[m.id] = { key, canvas: el };
+      }
+      continue;
+    }
+
     const src = p.video.currentSrc || p.video.src;
     const fv = await getFv(src);
     if (!fv || token !== stripToken) continue;
@@ -3955,7 +4130,7 @@ async function beginRecording() {
       if (!audioDest) audioDest = audioCtx.createMediaStreamDestination();
       for (const m of S.media) {
         const p = mediaPool[m.id];
-        if (!p || p.srcNode) continue;
+        if (!p || !p.video || p.srcNode) continue;    // у фото звука нет — нечего сводить
         p.video.muted = false;
         p.srcNode = audioCtx.createMediaElementSource(p.video);
         p.srcNode.connect(audioDest);
@@ -4006,7 +4181,7 @@ function stopRecording() {
   $('#ovSub').textContent = 'Собираю файл… это занимает пару секунд.';
   $('#ovCancel').disabled = true;
   try { recorder.stop(); } catch (_) {}
-  for (const id in mediaPool) { const p = mediaPool[id]; if (!p.srcNode) p.video.muted = true; }
+  for (const id in mediaPool) { const p = mediaPool[id]; if (p.video && !p.srcNode) p.video.muted = true; }
   $('#btnRecord').classList.remove('rec');
   $('#btnRecord2').classList.remove('on');
   $('#btnRecord2').textContent = '● Записать';
@@ -4422,7 +4597,8 @@ init();
 /* хук для отладки/автотестов */
 window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS, POSES, addClip, deleteClip,
   addScaleClip, clipKind,
-  addVideoFiles, deleteMedia, clearVideo, mediaDur, mediaAt, syncMedia, mediaPool, holdHead, holdTail,
+  addVideoFiles, addImageFile, deleteMedia, clearVideo, mediaDur, mediaAt, activeMedia, mediaKind,
+  syncMedia, mediaPool, holdHead, holdTail, stats,
   addScene, applyReel, deleteScene, sceneFade, sceneAt,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
