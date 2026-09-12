@@ -1709,10 +1709,35 @@ function sceneDefinition(b) {
     ? { name: 'Свой кадр', dur: b.dur, hint: 'Плавный переход к твоей позе. Положение задаёт конечный кадр; длину перехода меняй за край блока.' }
     : scenarioById(b.sc);
 }
+/* «Полная» длина плана — только для подписей (темп/фрагмент в layoutScene и
+   updateSceneMeta). У сценариев это фиксированный sc.dur из SCENARIOS — не
+   меняется split'ом/тримом. У 'custom' sceneDefinition() намеренно отдаёт
+   dur:b.dur (это нужно sceneAt/customPose для их взаимного сокращения —
+   трогать нельзя), поэтому после split b.dur — это уже длина ОДНОЙ половины,
+   а не всей дуги: rate/фрагмент по нему получались бы самореферентными (см.
+   находку). arcDur, если он есть (выставляется в splitSceneAt), хранит
+   длину дуги до первого разреза — вот его и используем здесь.            */
+function sceneTotalDur(b) {
+  return b.sc === 'custom' ? (Number.isFinite(b.arcDur) ? b.arcDur : b.dur) : sceneDefinition(b).dur;
+}
 function customPose(b, t) {
-  const list = sortedScenes(), prev = list[list.findIndex(x => x.id === b.id) - 1];
-  // Соседние пользовательские планы остаются соединёнными и после правки предыдущего.
-  const from = prev && prev.sc === 'custom' && Math.abs(sceneEnd(prev) - b.t0) < .01 ? prev.to : b.from;
+  const list = sortedScenes();
+  /* Дуга — цепочка смежных фрагментов ОДНОГО «Своего кадра»: после split/trim
+     у соседей s1 предыдущего равно s0 следующего. Точку from берём у первого
+     фрагмента дуги, а если тот сцеплен с предыдущим custom-планом — у того
+     prev.to. Иначе правая половина разрезанного плана оставалась бы со
+     старой копией from, и правка конца предыдущего плана давала бы скачок
+     ровно в точке среза (см. находку верификатора). Настоящие раздельные
+     планы (оба «+ Свой кадр», не резались) имеют s1=1 / s0=0 — в одну дугу
+     они не склеиваются.                                                   */
+  const sameArc = (p, q) => !!p && !!q && p.sc === 'custom' && q.sc === 'custom' &&
+    sceneS0(q) > 0 && Math.abs(sceneS1(p) - sceneS0(q)) < 1e-6 && Math.abs(sceneEnd(p) - q.t0) < .01;
+  let i = list.findIndex(x => x.id === b.id);
+  while (i > 0 && sameArc(list[i - 1], list[i])) i--;
+  const first = list[i], prev = list[i - 1];
+  const chained = !!prev && prev.sc === 'custom' && sceneS0(first) === 0 && sceneS1(prev) === 1 &&
+    Math.abs(sceneEnd(prev) - first.t0) < .01;
+  const from = chained ? prev.to : first.from;
   const u = EASES.smooth(clamp(t / b.dur, 0, 1)), pose = {};
   for (const k of POSE_FIELDS) {
     pose[k] = k === 'scale' || k === 'persp'
@@ -1744,17 +1769,29 @@ function beginPoseEdit(history = true) {
 function sceneEnd(b) { return b.t0 + b.dur; }
 function sortedScenes() { return S.scenes.slice().sort((a, b) => a.t0 - b.t0); }
 
+/* Доля сценария, которую реально играет блок: по умолчанию весь сценарий
+   (0..1). После splitSceneAt/trimSceneToPlayhead блок играет только свой
+   вырезанный кусок — s0/s1 держат его границы в долях длины sc.dur.        */
+function sceneS0(b) { return Number.isFinite(b.s0) ? b.s0 : 0; }
+function sceneS1(b) { return Number.isFinite(b.s1) ? b.s1 : 1; }
+
 /* Какой блок сцены действует в момент t: внутри блока — он сам, в промежутке
-   между блоками — предыдущий (камера замирает в его финале), до первого —
-   первый в стартовой позе.                                                 */
+   между блоками — предыдущий (камера замирает в его финале, но в точке
+   среза s1, а не обязательно в конце сценария — см. sceneS0/sceneS1), до
+   первого — первый блок в его СТАРТОВОЙ позе (тоже с учётом среза s0).     */
 function sceneAt(t) {
   const list = sortedScenes();
   if (!list.length) return null;
   let cur = null;
   for (const b of list) { if (t >= b.t0) cur = b; else break; }
-  if (!cur) return { block: list[0], local: 0 };
+  if (!cur) {
+    const first = list[0];
+    return { block: first, local: sceneS0(first) * sceneDefinition(first).dur };
+  }
   const sc = sceneDefinition(cur);
-  const local = (t - cur.t0) / Math.max(0.1, cur.dur) * sc.dur;
+  const s0 = sceneS0(cur), s1 = sceneS1(cur);
+  const u = clamp((t - cur.t0) / Math.max(0.1, cur.dur), 0, 1);
+  const local = (s0 + u * (s1 - s0)) * sc.dur;
   return { block: cur, local };
 }
 
@@ -2737,6 +2774,106 @@ function trimToPlayhead(side) {
   toast(side === 'head' ? 'Обрезано до плейхеда' : 'Обрезано после плейхеда');
 }
 
+/* Блок сцены, что сейчас выбран и стоит под плейхедом — с тем же отступом
+   0.15 с от краёв, что и у клипов (см. clipUnderPlayhead): резать/делить
+   у самого края означало бы оставить огрызок в доли секунды.              */
+function sceneUnderPlayhead(t = clock) {
+  const b = getScene(S.selScene);
+  if (!b) return null;
+  return (t >= b.t0 + 0.15 && t <= sceneEnd(b) - 0.15) ? b : null;
+}
+
+/* Разрезать выбранный план по плейхеду на два блока. Оба продолжают играть
+   ОДИН и тот же исходный сценарий (b.sc не меняется) — просто каждый теперь
+   отвечает только за свою долю [s0,s1]. f — то же самое u, что считает
+   sceneAt для точки t внутри блока, поэтому отображение t→local до и после
+   разреза совпадает: план распался на два куска без скачка позы.          */
+function splitSceneAt(t = clock) {
+  const b = getScene(S.selScene);
+  if (!b) return;
+  pushHist();
+  const t0 = b.t0, dur = b.dur, end = sceneEnd(b);
+  const f = clamp((t - t0) / Math.max(0.1, dur), 0, 1);
+  const s0 = sceneS0(b), s1 = sceneS1(b);
+  const mid = Math.round((s0 + f * (s1 - s0)) * 1e4) / 1e4;
+  // Копия остальных полей блока (transition, from/to у 'custom' и т.п.) —
+  // кроме id/t0/dur/s0/s1, которые правая половина получает свои.
+  const right = { ...b, id: newSceneId(),
+    t0: Math.round(t * 100) / 100, dur: Math.round((end - t) * 100) / 100,
+    s0: mid, s1 };
+  // Новый внутренний стык не должен ничего менять визуально: если раньше
+  // тут не было затемнения — не появится и после разреза, даже если стыки
+  // сцен сейчас выставлены на «с затемнением» (см. находку). Внешние
+  // границы блока трогать незачем — они хранятся в самом b и остаются как
+  // были: у b (левая половина) — тот же b.transition, что и до разреза, у
+  // правой границы (после right) ничего не появилось.
+  right.transition = 'cut';
+  if (b.sc === 'custom') {
+    // from/to у 'custom' — объекты, а не примитивы: без глубокой копии обе
+    // половины держат ОДИН и тот же объект, и правка позы одной половины
+    // молча меняет другую (см. находку). arcDur замораживает длину дуги
+    // ДО этого (первого) разреза — используется только в подписях
+    // (sceneTotalDur); сама поза (customPose/sceneAt) по-прежнему считается
+    // через b.dur, его не трогаем.
+    right.from = { ...b.from };
+    right.to = { ...b.to };
+    right.arcDur = b.arcDur = Number.isFinite(b.arcDur) ? b.arcDur : dur;
+  }
+  b.dur = Math.round((t - t0) * 100) / 100;
+  b.s0 = s0; b.s1 = mid;
+  S.scenes.splice(S.scenes.indexOf(b) + 1, 0, right);
+  S.selScene = right.id;
+  renderTimeline(); save();
+  toast('План разделён');
+}
+
+/* Обрезать выбранный план по плейхеду — без ripple: сцены оверлей по
+   времени, соседние блоки на дорожке не двигаются, и плейхед остаётся на
+   месте. 'head' режет начало (t0 сдвигается к плейхеду, s0 растёт до точки
+   среза), 'tail' — конец (s1 падает до точки среза, dur укорачивается).
+   Отрезанная доля нигде не хранится — вернуть её можно только через undo,
+   план заново от начала до конца после этого не проигрывается (см. бриф). */
+function trimSceneToPlayhead(side) {
+  const b = getScene(S.selScene);
+  if (!b) return;
+  const t = clock;
+  pushHist();
+  const t0 = b.t0, dur = b.dur, end = sceneEnd(b);
+  const f = clamp((t - t0) / Math.max(0.1, dur), 0, 1);
+  const s0 = sceneS0(b), s1 = sceneS1(b);
+  const mid = Math.round((s0 + f * (s1 - s0)) * 1e4) / 1e4;
+  // У «Своего кадра» длина дуги — это dur целого плана; после обрезки она
+  // нужна подписям и темпу, поэтому замораживаем её так же, как в split.
+  if (b.sc === 'custom') b.arcDur = Number.isFinite(b.arcDur) ? b.arcDur : dur;
+  if (side === 'head') {
+    b.s0 = mid; b.s1 = s1;
+    b.t0 = Math.round(t * 100) / 100;
+    b.dur = Math.round((end - t) * 100) / 100;
+  } else {
+    b.s0 = s0; b.s1 = mid;
+    b.dur = Math.round((t - t0) * 100) / 100;
+  }
+  renderTimeline(); save();
+  toast(side === 'head' ? 'План обрезан до плейхеда' : 'План обрезан после плейхеда');
+}
+
+/* Диспетчеры для клавиш s/q/w и кнопок ✂/⇤/⇥: если под плейхедом стоит
+   выбранный план — режем план, иначе — как раньше, клип на видеодорожке. */
+/* Плейхед внутри ВЫБРАННОГО плана, но ближе 0.15 с к его краю: молча уйти
+   на видеодорожку нельзя — пользователь выбрал план и нажал «Разделить». */
+function sceneEdgeBlocked() {
+  const b = getScene(S.selScene);
+  return !!b && clock > b.t0 && clock < sceneEnd(b) && !sceneUnderPlayhead();
+}
+function splitAtPlayhead() {
+  if (sceneEdgeBlocked()) { toast('Слишком близко к краю плана'); return; }
+  return sceneUnderPlayhead() ? splitSceneAt() : splitMediaAt();
+}
+function trimAtPlayhead(side) {
+  if (sceneEdgeBlocked()) { toast('Слишком близко к краю плана'); return; }
+  return sceneUnderPlayhead() ? trimSceneToPlayhead(side) : trimToPlayhead(side);
+}
+
 /* Удаление с подтяжкой (ripple) — только видеодорожка: клипы правее места
    удаления сдвигаются влево на длину убранного куска. Наезды и сцены не
    трогаем — они, как оверлеи в CapCut, привязаны к времени ролика, а не
@@ -3103,9 +3240,9 @@ window.addEventListener('keydown', e => {
   }
   if (mod && (e.key === 'y' || e.key === 'Y' || e.key === 'н')) { e.preventDefault(); redo(); return; }
   if (!mod && !e.altKey) {
-    if (e.key === 's' || e.key === 'ы') { e.preventDefault(); splitMediaAt(); return; }
-    if (e.key === 'q' || e.key === 'й') { e.preventDefault(); trimToPlayhead('head'); return; }
-    if (e.key === 'w' || e.key === 'ц') { e.preventDefault(); trimToPlayhead('tail'); return; }
+    if (e.key === 's' || e.key === 'ы') { e.preventDefault(); splitAtPlayhead(); return; }
+    if (e.key === 'q' || e.key === 'й') { e.preventDefault(); trimAtPlayhead('head'); return; }
+    if (e.key === 'w' || e.key === 'ц') { e.preventDefault(); trimAtPlayhead('tail'); return; }
     if (e.key === 't' || e.key === 'е') { e.preventDefault(); addTransitionAtPlayhead(); return; }
     if (e.key === '-' || e.key === '_') { e.preventDefault(); setZoom(S.tl.pps / 1.25, clock); return; }
     if (e.key === '=' || e.key === '+') { e.preventDefault(); setZoom(S.tl.pps * 1.25, clock); return; }
@@ -3992,9 +4129,11 @@ function layoutScene(b) {
   const D = tlDur();
   el.style.left = tToPct(b.t0) + '%';
   el.style.width = Math.max(0.4, (b.dur / D) * 100) + '%';
-  const rate = sc.dur ? b.dur / sc.dur : 1;
+  const s0 = sceneS0(b), s1 = sceneS1(b);
+  const rate = b.dur / Math.max(0.1, (s1 - s0) * sceneTotalDur(b));
+  const frag = (s0 > 0 || s1 < 1) ? ' · фрагмент' : '';
   el.querySelector('b').textContent =
-    `${sc.name.split(' → ')[0].split(' · ')[0]} · ${b.dur.toFixed(1)} с` + (Math.abs(rate - 1) > 0.05 ? ` (${rate.toFixed(2)}×)` : '');
+    `${sc.name.split(' → ')[0].split(' · ')[0]} · ${b.dur.toFixed(1)} с` + (Math.abs(rate - 1) > 0.05 ? ` (${rate.toFixed(2)}×)` : '') + frag;
   el.classList.toggle('sel', b.id === S.selScene);
   updateSceneMeta();
 }
@@ -4243,7 +4382,7 @@ function updatePlayhead() {
     }
   }
 
-  const enabled = !!clipUnderPlayhead();
+  const enabled = !!(clipUnderPlayhead() || sceneUnderPlayhead());
   if (enabled !== editBtnsEnabled) {
     editBtnsEnabled = enabled;
     $('#btnSplit').disabled = !enabled;
@@ -4840,9 +4979,9 @@ function buildUI() {
   $('#fcDelete').addEventListener('click', () => S.sel && deleteClip(S.sel));
   $('#btnAddZoom').addEventListener('click', addClip);
   $('#btnAddScale').addEventListener('click', addScaleClip);
-  $('#btnSplit').addEventListener('click', () => splitMediaAt());
-  $('#btnTrimL').addEventListener('click', () => trimToPlayhead('head'));
-  $('#btnTrimR').addEventListener('click', () => trimToPlayhead('tail'));
+  $('#btnSplit').addEventListener('click', () => splitAtPlayhead());
+  $('#btnTrimL').addEventListener('click', () => trimAtPlayhead('head'));
+  $('#btnTrimR').addEventListener('click', () => trimAtPlayhead('tail'));
   $('#btnTrans').addEventListener('click', addTransitionAtPlayhead);
 
   // Всплывающая панель над маркером перехода (#trPop, см. B в брифе) — один
@@ -4943,10 +5082,14 @@ function updateSceneMeta() {
   const b = getScene(S.selScene) || sortedScenes()[0];
   if (!b) { el.textContent = 'Сцен нет. Нажми на приём — он встанет на дорожку в место плейхеда, или выбери готовый ролик.'; return; }
   const sc = sceneDefinition(b);
-  const rate = sc.dur ? b.dur / sc.dur : 1;
+  const s0 = sceneS0(b), s1 = sceneS1(b);
+  const isFrag = s0 > 0 || s1 < 1;
+  const totalDur = sceneTotalDur(b);
+  const rate = b.dur / Math.max(0.1, (s1 - s0) * totalDur);
   el.innerHTML =
     `<b style="color:#c6ccdc">${sc.name}</b> · ${b.t0.toFixed(1)}–${sceneEnd(b).toFixed(1)} с` +
     (Math.abs(rate - 1) > 0.05 ? ` · темп ${rate.toFixed(2)}×` : '') +
+    (isFrag ? `<br><span style="color:#8b93a7">фрагмент плана: ${(s0 * totalDur).toFixed(1)}–${(s1 * totalDur).toFixed(1)} с из ${totalDur.toFixed(1)}</span>` : '') +
     `<br>${sc.hint}` +
     (S.scenes.length > 1 ? `<br><span style="color:#8b93a7">Всего сцен: ${S.scenes.length}. Стыки: ${S.scenes.some(x => (x.transition || S.scene.transition) === 'dip') ? 'с затемнением' : 'прямые склейки'}.</span>` : '');
 }
@@ -5028,6 +5171,12 @@ function load() {
     for (const b of S.scenes) {
       if (!b.id) b.id = newSceneId();
       const n = +String(b.id).replace(/\D/g, ''); if (n >= sceneSeq) sceneSeq = n + 1;
+      // Битые/бессмысленные доли (не число, вне [0,1], s0>=s1) — считаем, что
+      // блок играет сценарий целиком, а не запоминаем половинчатый обрез.
+      if (!(Number.isFinite(b.s0) && Number.isFinite(b.s1) &&
+            b.s0 >= 0 && b.s0 <= 1 && b.s1 >= 0 && b.s1 <= 1 && b.s0 < b.s1)) {
+        delete b.s0; delete b.s1;
+      }
     }
     if (S.selScene && !S.scenes.some(b => b.id === S.selScene)) S.selScene = null;
     if (!Array.isArray(S.clips)) S.clips = [];
@@ -5188,6 +5337,8 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   syncMedia, mediaPool, holdHead, holdTail, stats,
   restoreMedia, idb: { get: idbGet, keys: idbKeys, del: idbDelete, clear: idbClear },
   addScene, addCustomScene, applyReel, deleteScene, sceneFade, sceneAt, composedPose,
+  splitSceneAt, trimSceneToPlayhead, sceneUnderPlayhead, splitAtPlayhead, trimAtPlayhead,
+  sceneS0, sceneS1,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
   get last(){ return lastRender }, get lastCam(){ return lastCam }, get selecting(){ return selecting }, startSelect, endSelect,

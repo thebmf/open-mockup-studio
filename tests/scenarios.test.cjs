@@ -31,8 +31,8 @@ function setup() {
     const smoother=t=>t*t*t*(t*(t*6-15)+10);
     ${motion}
     ${src.slice(src.indexOf('const POSE_FIELDS'),src.indexOf('function sceneEnd('))}
-    ${['scenarioById','sceneEnd','sortedScenes','sceneAt','sceneFade','composedPose','snap','pushHist','applySnap','applyReel','sceneDuration','migrateReelDuration','addCustomScene'].map(fn).join('\n')}
-    globalThis.api={S,SCENARIOS,REELS,KEYF,evalScenario,composedPose,sceneFade,applyReel,snap,applySnap,hist,sceneDuration,migrateReelDuration,addCustomScene,editablePose,beginPoseEdit,validCustomScene,setClock:t=>clock=t};
+    ${['scenarioById','sceneEnd','sortedScenes','sceneS0','sceneS1','sceneAt','customPose','sceneFade','composedPose','snap','pushHist','applySnap','applyReel','sceneDuration','migrateReelDuration','addCustomScene','sceneUnderPlayhead','splitSceneAt','trimSceneToPlayhead','getScene'].map(fn).join('\n')}
+    globalThis.api={S,SCENARIOS,REELS,KEYF,evalScenario,composedPose,sceneFade,applyReel,snap,applySnap,hist,sceneDuration,migrateReelDuration,addCustomScene,editablePose,beginPoseEdit,validCustomScene,setClock:t=>clock=t,sceneAt,sceneUnderPlayhead,splitSceneAt,trimSceneToPlayhead,getScene,sceneS0,sceneS1,sortedScenes};
   `, c);
   return c.api;
 }
@@ -152,4 +152,61 @@ test('custom scenes survive project serialization and undo; explicit export grow
   assert.ok(a.validCustomScene(a.S.scenes.at(-1)));
   assert.ok(Math.abs(a.composedPose(20).ry-30)<1e-10);
   assert.equal(a.validCustomScene({sc:'custom',from:custom.from,to:{}}),false);
+});
+
+test('sceneAt slices the scenario by s0/s1 fractions and holds at the cut point',()=>{
+  const a=setup();
+  const sc=a.SCENARIOS.find(s=>s.id==='revealLow');
+  a.S.scenes=[{id:'s1',sc:'revealLow',t0:2,dur:10,s0:.2,s1:.6}];
+  // до первого блока — стартовая поза СРЕЗА (s0), а не начало всего сценария
+  assert.ok(Math.abs(a.sceneAt(0).local-.2*sc.dur)<1e-9);
+  // внутри блока — доля времени линейно ложится на долю [s0,s1] сценария
+  assert.ok(Math.abs(a.sceneAt(7).local-(.2+.5*(.6-.2))*sc.dur)<1e-9);
+  assert.ok(Math.abs(a.sceneAt(12).local-.6*sc.dur)<1e-9); // ровно конец блока = s1
+  // после конца блока (и сколь угодно дальше) — держит позу s1, а не едет к концу sc.dur
+  assert.equal(a.sceneAt(20).local,a.sceneAt(12).local);
+  assert.ok(Math.abs(a.sceneAt(100).local-.6*sc.dur)<1e-9);
+});
+
+test('splitSceneAt preserves the t→local mapping; deleting one half leaves the other untouched',()=>{
+  const a=setup();
+  const sc=a.SCENARIOS.find(s=>s.id==='revealLow');
+  a.S.scenes=[{id:'sOrig',sc:'revealLow',t0:0,dur:10}];
+  a.S.selScene='sOrig';
+  const ts=[]; for(let t=-2;t<=14;t+=.5) ts.push(t);
+  const before=ts.map(t=>a.sceneAt(t).local);
+
+  a.splitSceneAt(4);
+  assert.equal(a.S.scenes.length,2);
+  const [left,right]=a.sortedScenes();
+  assert.equal(left.t0,0); assert.equal(left.dur,4);
+  assert.ok(Math.abs(left.s0-0)<1e-9); assert.ok(Math.abs(left.s1-.4)<1e-9);
+  assert.equal(right.t0,4); assert.equal(right.dur,6);
+  assert.ok(Math.abs(right.s0-.4)<1e-9); assert.ok(Math.abs(right.s1-1)<1e-9);
+  assert.equal(a.S.selScene,right.id);
+
+  // Разрез — это то же самое отображение t→local, распавшееся на два блока:
+  // ни до, ни внутри, ни после (в held-хвосте) ничего не меняется.
+  ts.forEach((t,i)=>assert.ok(Math.abs(a.sceneAt(t).local-before[i])<1e-9,`t=${t}`));
+
+  // Удаляем правую половину — левая играет только [0,.4] сценария и дальше
+  // держит срез, а не «доигрывает» вырезанный кусок до конца.
+  a.S.scenes=a.S.scenes.filter(b=>b.id!==right.id);
+  ts.forEach((t,i)=>{ if (t<=4) assert.ok(Math.abs(a.sceneAt(t).local-before[i])<1e-9,`kept t=${t}`); });
+  assert.ok(Math.abs(a.sceneAt(9).local-left.s1*sc.dur)<1e-9);
+});
+
+test('a split custom shot stays chained to the previous shot when its endpoint is edited',()=>{
+  const a=setup(); a.applyReel(a.REELS[0]);
+  const first=a.addCustomScene(3); a.editablePose().x=.2;
+  const second=a.addCustomScene(4); a.editablePose().x=-.2;
+  // Cut the second shot in the middle, then move the first shot's endpoint.
+  a.S.selScene=second.id; a.setClock(20); a.splitSceneAt();
+  a.S.selScene=first.id; a.setClock(18); a.beginPoseEdit().x=.35;
+  assert.ok(Math.abs(a.composedPose(18).x-.35)<1e-10);
+  assert.ok(Math.abs(a.composedPose(22).x+.2)<1e-10);
+  // No jump at the cut: both halves interpolate the same arc from the new start.
+  assert.ok(Math.abs(a.composedPose(19.99).x-a.composedPose(20.01).x)<0.01);
+  const left=a.getScene(second.id), right=a.sortedScenes().find(b=>b.t0===20);
+  assert.equal(a.sceneS1(left),a.sceneS0(right));
 });
