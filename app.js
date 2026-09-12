@@ -171,8 +171,20 @@ function h1(n){ const x = Math.sin(n * 127.1) * 43758.5453; return x - Math.floo
 function n1(x){ const i = Math.floor(x), f = x - i, u = f*f*(3-2*f); return h1(i)*(1-u) + h1(i+1)*u; }
 function nz(x){ return (n1(x)*0.55 + n1(x*2.13+7.7)*0.3 + n1(x*4.37+19.1)*0.15) * 2 - 1; }
 
+/* Плавный проезд: короткий разгон и торможение, постоянная скорость
+   в середине. Интеграл smoothstep даёт нулевые скорость и ускорение
+   на обоих концах, без рывка при переходе в неподвижный кадр. */
+function easeGlide(t) {
+  const ramp = .2, speed = 1 / (1 - ramp);
+  const area = u => u * u * u - .5 * u * u * u * u;
+  if (t < ramp) return speed * ramp * area(t / ramp);
+  if (t > 1 - ramp) return 1 - speed * ramp * area((1 - t) / ramp);
+  return speed * (t - ramp / 2);
+}
+
 const EASES = {
   lin:   t => t,
+  glide: easeGlide,
   smooth: t => t * t * t * (t * (t * 6 - 15) + 10),   // нулевая скорость И ускорение на концах
   out:   easeOutCubic,
   expo:  easeOutExpo,
@@ -180,99 +192,129 @@ const EASES = {
   in:    t => t * t * t,
 };
 
-/* Сценарий — один приём продуктовой съёмки: медленный проход камеры между
-   двумя позами, где масштаб, поворот и сдвиг меняются ОДНОВРЕМЕННО — одна
-   ось в движении всегда выглядит дёшево. Телефон крупный, часто обрезан краями.
-   Ключи задают смещение от твоего положения; после последнего ключа камера
-   замирает. dx/dy — доли кадра, ds — прибавка к масштабу, drx/dry/drz —
-   градусы, lx/ly — куда уезжает пятно света на студийном заднике.          */
+/* Режиссёрские сцены: читаемый первый кадр, мотивированное движение,
+   выдержка в конце. Ключ e принадлежит ВХОДЯЩЕМУ сегменту. Старые ID
+   сохранены, чтобы проекты продолжали открываться. */
 const SCENARIOS = [
-  { id: 'none', name: 'Без сценария', dur: 0, hint: 'камера стоит там, где ты её поставил', keys: [] },
-
-  { id: 'revealLow', name: 'Взгляд снизу → общий план', dur: 10, tag: 'раскрытие',
-    hint: 'макро на «острове», глядя на телефон снизу, потом долгий отъезд до общего плана.',
+  { id: 'none', name: 'Без сценария', dur: 0, hint: 'Свободная камера.', keys: [] },
+  { id: 'revealLow', name: 'Первое появление', dur: 4.5, tag: 'Раскрытие',
+    hint: 'Крупная деталь → уверенный отъезд → чистый фронт. Открывающий кадр запуска продукта.',
     keys: [
-      { t: 0,  drx: 30, dry: 0,  drz: 0, ds: 1.60, dy: 0.60, lx: -0.06 },
-      { t: 10, drx: 1,  dry: 0,  drz: 0, ds: -0.38, dy: 0.02, lx: 0.04, e: 'smooth' },
+      { t: 0, ds: 1.15, dy: .36, drx: 14, dry: -18, drz: -4, lx: -.16 },
+      { t: 3.6, ds: .03, dy: -.02, drx: 0, dry: 0, drz: 0, lx: .06, e: 'smooth' },
+      { t: 4.5, ds: .03, dy: -.02, drx: 0, dry: 0, drz: 0, lx: .06, e: 'smooth' },
     ] },
-
-  { id: 'panDown', name: 'Экран сверху вниз', dur: 10, tag: 'детали',
-    hint: 'камера вплотную и медленно едет по интерфейсу — видно каждую часть экрана.',
+  { id: 'panDown', name: 'Интерфейс · сверху вниз', dur: 5, tag: 'Продукт',
+    hint: 'Спокойный проезд по экрану без вращения: интерфейс остаётся читаемым.',
     keys: [
-      { t: 0,  drx: 2, dry: -7, drz: 0, ds: 0.95, dy: 0.46 },
-      { t: 10, drx: 0, dry: 3,  drz: 0, ds: 0.95, dy: -0.46, e: 'smooth' },
+      { t: 0, ds: .68, dy: .24, dry: -3, drx: 1 },
+      { t: 5, ds: .68, dy: -.24, dry: -3, drx: 1, e: 'glide' },
     ] },
-
-  { id: 'panUp', name: 'Экран снизу вверх', dur: 10, tag: 'детали',
-    hint: 'тот же проезд по экрану, но снизу к «острову».',
+  { id: 'panUp', name: 'Интерфейс · снизу вверх', dur: 5, tag: 'Продукт',
+    hint: 'Обратный проезд по экрану. Подходит для показа результата действия.',
     keys: [
-      { t: 0,  drx: -2, dry: 6,  drz: 0, ds: 0.95, dy: -0.46 },
-      { t: 10, drx: 0,  dry: -4, drz: 0, ds: 0.95, dy: 0.46, e: 'smooth' },
+      { t: 0, ds: .68, dy: -.24, dry: 3, drx: -1 },
+      { t: 5, ds: .68, dy: .24, dry: 3, drx: -1, e: 'glide' },
     ] },
-
-  { id: 'deckSlide', name: 'На столе', dur: 8, tag: 'герой',
-    hint: 'лежит по диагонали и медленно скользит; по стеклу пробегает блик.',
+  { id: 'deckSlide', name: 'Скульптура', dur: 4, tag: 'Форма',
+    hint: 'Диагональная композиция и боковой свет подчёркивают объём корпуса.',
     keys: [
-      { t: 0, drx: 55, dry: 9,  drz: -46, ds: 0.95, dx: -0.11, dy: 0.04, lx: -0.10 },
-      { t: 8, drx: 49, dry: -3, drz: -36, ds: 0.85, dx: 0.09,  dy: -0.03, lx: 0.08, e: 'smooth' },
+      { t: 0, drx: 32, dry: -12, drz: -24, ds: .15, dx: -.055, lx: -.18 },
+      { t: 4, drx: 27, dry: 6, drz: -20, ds: .19, dx: .035, lx: .15, e: 'glide' },
     ] },
-
-  { id: 'truckReveal', name: 'Проезд с разворотом', dur: 10, tag: 'раскрытие',
-    hint: 'слева крупно вполоборота → едет вправо, разворачивается во фронт и отъезжает.',
+  { id: 'truckReveal', name: 'Из профиля во фронт', dur: 3.5, tag: 'Раскрытие',
+    hint: 'Тонкий силуэт раскрывается в экран. Быстрый акцент с мягкой посадкой.',
     keys: [
-      { t: 0,  dx: -0.26, dry: -36, drx: 9, drz: -7, ds: 0.75, lx: -0.12 },
-      { t: 10, dx: 0.16,  dry: 0,   drx: 2, drz: 0,  ds: -0.22, lx: 0.10, e: 'smooth' },
+      { t: 0, dry: -54, drx: 5, drz: -3, dx: -.13, ds: .12, lx: -.2 },
+      { t: 2.8, dry: 0, drx: 0, drz: 0, dx: 0, ds: .04, lx: .08, e: 'smooth' },
+      { t: 3.5, dry: 0, drx: 0, drz: 0, dx: 0, ds: .04, lx: .08, e: 'smooth' },
     ] },
-
-  { id: 'turn34', name: 'Полуоборот', dur: 6, tag: 'герой',
-    hint: 'стоит вполоборота и еле заметно доворачивается — спокойный кадр под голос.',
+  { id: 'turn34', name: 'Орбита', dur: 4, tag: 'Форма',
+    hint: 'Сдержанная дуга камеры вокруг устройства. Объём без случайного покачивания.',
     keys: [
-      { t: 0, dry: -24, drx: 6, drz: -3, ds: 0.36 },
-      { t: 6, dry: -7,  drx: 3, drz: -1, ds: 0.44, e: 'smooth' },
+      { t: 0, dry: -22, drx: 6, ds: .08, lx: -.14 },
+      { t: 4, dry: 14, drx: 6, ds: .08, lx: .14, e: 'smooth' },
     ] },
-
-  { id: 'lowFlare', name: 'Снизу с бликом', dur: 6.3, tag: 'герой',
-    hint: 'наклонён к зрителю, по низу экрана горит блик; медленно выпрямляется.',
+  { id: 'lowFlare', name: 'Свет по стеклу', dur: 3.5, tag: 'Форма',
+    hint: 'Низкий ракурс и небольшой доворот ловят мягкое отражение на стекле.',
     keys: [
-      { t: 0,   drx: 26, dry: -12, drz: -14, ds: 0.78, dy: 0.16, dx: 0.05 },
-      { t: 6.3, drx: 9,  dry: -4,  drz: -5,  ds: 0.70, dy: 0.05, dx: 0.02, e: 'smooth' },
+      { t: 0, drx: 20, dry: -22, drz: -8, ds: .25, dy: .06, lx: -.15 },
+      { t: 3.5, drx: 8, dry: -5, drz: -3, ds: .22, dy: .01, lx: .16, e: 'smooth' },
     ] },
-
-  { id: 'studioLight', name: 'Витрина со светом', dur: 8, tag: 'витрина',
-    hint: 'телефон маленький и почти неподвижен — движется пятно света по студии.',
+  { id: 'studioLight', name: 'Тихий финал', dur: 4, tag: 'Финал',
+    hint: 'Неподвижный фронт, воздух для заголовка и медленно движущийся свет.',
     keys: [
-      { t: 0, ds: -0.42, dry: -4, lx: -0.22, ly: -0.04 },
-      { t: 8, ds: -0.40, dry: 4,  lx: 0.22,  ly: 0.02, e: 'smooth' },
+      { t: 0, ds: -.10, dy: .045, lx: -.12 },
+      { t: 4, ds: -.10, dy: .045, lx: .12, e: 'smooth' },
     ] },
-
-  { id: 'topMacro', name: 'Макро сверху', dur: 10, tag: 'детали',
-    hint: 'очень крупно верх экрана и «остров», лёгкий дрейф вбок.',
+  { id: 'topMacro', name: 'Точная деталь', dur: 2.5, tag: 'Деталь',
+    hint: 'Крупный верх экрана, остров и фаска. Короткая перебивка между общими планами.',
     keys: [
-      { t: 0,  ds: 1.70, dy: 0.55, drx: 4, dry: -6, dx: -0.04 },
-      { t: 10, ds: 1.62, dy: 0.50, drx: 2, dry: 6,  dx: 0.04, e: 'smooth' },
+      { t: 0, ds: 1.12, dy: .38, dry: -9, drx: 5, dx: -.025, lx: -.12 },
+      { t: 2.5, ds: 1.08, dy: .37, dry: -2, drx: 5, dx: .025, lx: .08, e: 'glide' },
     ] },
-
-  { id: 'heroHold', name: 'Герой (финал)', dur: 6, tag: 'финал',
-    hint: 'ровный крупный кадр с едва заметным движением — под логотип или призыв.',
+  { id: 'heroHold', name: 'Главный кадр', dur: 4, tag: 'Финал',
+    hint: 'Медленное приближение, ровный экран и остановка под финальную фразу.',
     keys: [
-      { t: 0, drx: 5, dry: -9, drz: -2, ds: 0.36 },
-      { t: 6, drx: 3, dry: -5, drz: -1, ds: 0.40, e: 'smooth' },
+      { t: 0, ds: -.04, dy: .015, dry: -4, drx: 2, lx: -.05 },
+      { t: 3, ds: .04, dy: .015, dry: 0, drx: 0, lx: .04, e: 'smooth' },
+      { t: 4, ds: .04, dy: .015, dry: 0, drx: 0, lx: .04, e: 'smooth' },
+    ] },
+  { id: 'screenProof', name: 'Покажи, как работает', dur: 5, tag: 'Продукт',
+    hint: 'Фронтальный экран без бликовой акробатики: место для демонстрации главной функции.',
+    keys: [
+      { t: 0, ds: .12, dy: -.015 },
+      { t: 4, ds: .18, dy: -.015, e: 'smooth' },
+      { t: 5, ds: .18, dy: -.015, e: 'smooth' },
+    ] },
+  { id: 'edgeSignature', name: 'Линия корпуса', dur: 2, tag: 'Деталь',
+    hint: 'Крупный ракурс в три четверти: материал, кнопки и тонкая грань.',
+    keys: [
+      { t: 0, dry: -42, drx: 7, ds: .48, dx: -.04, dy: .08, lx: -.2 },
+      { t: 2, dry: -32, drx: 7, ds: .46, dx: .01, dy: .08, lx: .12, e: 'glide' },
+    ] },
+  { id: 'loopOrbit', name: 'Бесшовная орбита', dur: 8, tag: 'Петля',
+    hint: 'Замкнутая дуга: первый и последний кадры совпадают, включая свет.',
+    keys: [
+      { t: 0, dry: -16, drx: 5, ds: .06, lx: -.12 },
+      { t: 4, dry: 16, drx: 5, ds: .06, lx: .12, e: 'smooth' },
+      { t: 8, dry: -16, drx: 5, ds: .06, lx: -.12, e: 'smooth' },
     ] },
 ];
 
-/* Ролик — готовая последовательность сцен с уходом в чёрное между ними.
-   Так снимают промо: раскрытие → детали экрана → герой → витрина.          */
+/* Монтажные истории. Длительности включают все стыки, без скрытых пауз.
+   cut — прямая склейка; dip — короткий уход через чёрное. */
 const REELS = [
-  { id: 'promo30', name: 'Промо · 30 с',
-    seq: [['revealLow', 8], ['panDown', 8], ['deckSlide', 6], ['studioLight', 8]] },
-  { id: 'short15', name: 'Короткий · 15 с',
-    seq: [['revealLow', 6], ['panDown', 5], ['heroHold', 4]] },
-  { id: 'details20', name: 'Детали · 20 с',
-    seq: [['topMacro', 6], ['panDown', 8], ['lowFlare', 6]] },
-  { id: 'cinema25', name: 'Кино · 25 с',
-    seq: [['truckReveal', 8], ['deckSlide', 6], ['panUp', 6], ['heroHold', 5]] },
+  { id: 'short15', name: 'Запуск', eyebrow: 'LAUNCH FILM', duration: 15, look: 'pearl',
+    hint: 'Первое впечатление → главная функция → желание попробовать.',
+    beats: 'Раскрыть · Показать · Запомниться',
+    seq: [['truckReveal', 3], ['topMacro', 2], ['screenProof', 6], ['heroHold', 4]] },
+  { id: 'impact8', name: 'Стоп-скролл', eyebrow: 'SOCIAL TEASER', duration: 8, look: 'graphite',
+    hint: 'Контраст крупностей с первой секунды. Для короткого анонса.',
+    beats: 'Грань · Разворот · Продукт · Финал',
+    seq: [['edgeSignature', 1.2], ['truckReveal', 1.8], ['screenProof', 3], ['heroHold', 2]] },
+  { id: 'details20', name: 'Всё в деталях', eyebrow: 'DESIGN STORY', duration: 20, look: 'pearl',
+    hint: 'Материал, стекло, точность интерфейса. Спокойная история о качестве.',
+    beats: 'Деталь · Форма · Экран · Свет · Финал',
+    seq: [['topMacro', 3], ['deckSlide', 4], ['panDown', 5], ['lowFlare', 3], ['studioLight', 5]] },
+  { id: 'cinema25', name: 'Премьера', eyebrow: 'SIGNATURE FILM', duration: 25, look: 'graphite',
+    hint: 'Выразительное раскрытие и размеренный монтаж для большого анонса.',
+    beats: 'Интрига · Силуэт · Деталь · Демо · Финал',
+    seq: [['revealLow', 5], ['turn34', 4], ['edgeSignature', 3], ['screenProof', 8], ['heroHold', 5, 'dip']] },
+  { id: 'promo30', name: 'Продукт в действии', eyebrow: 'PRODUCT DEMO', duration: 30, look: 'pearl',
+    hint: 'Больше времени на реальный сценарий использования и объяснение ценности.',
+    beats: 'Знакомство · Демо · Детали · Результат · CTA',
+    seq: [['truckReveal', 4], ['screenProof', 10], ['panDown', 5], ['panUp', 5], ['studioLight', 6]] },
+  { id: 'loop8', name: 'Бесконечный кадр', eyebrow: 'SEAMLESS LOOP', duration: 8, look: 'graphite',
+    hint: 'Медленная орбита без заметного шва. Для атмосферного ролика на повторе.',
+    beats: 'Один кадр · Замкнутое движение',
+    seq: [['loopOrbit', 8]] },
 ];
-const REEL_GAP = 0.45;      // уход в чёрное между сценами, с
+const REEL_LOOKS = {
+  pearl: { bg: { preset: 'studioLight', type: 'studio', a: '#fbf8f3', b: '#cfc8bd', angle: 135, blur: 0, dim: 0 }, glare: .055, vignette: .10 },
+  graphite: { bg: { preset: 'studioDark', type: 'studio', a: '#8e8f96', b: '#15161b', angle: 135, blur: 0, dim: 0 }, glare: .08, vignette: .20 },
+};
+const REEL_GAP = 0.24;
 
 const KEYF = ['dx', 'dy', 'ds', 'drx', 'dry', 'drz', 'lx', 'ly'];
 
@@ -294,7 +336,9 @@ function evalScenario(t, sc) {
   let i = 0;
   while (i < K.length - 1 && K[i + 1].t <= t) i++;
   const a = K[i], b = K[i + 1];
-  const e = easeMix((t - a.t) / Math.max(1e-6, b.t - a.t));
+  const u = (t - a.t) / Math.max(1e-6, b.t - a.t);
+  // Авторская кривая работает на каждом сегменте; старые ключи без e — через регулятор.
+  const e = b.e && EASES[b.e] ? lerp(u, EASES[b.e](u), clamp(S.scene.ease, 0, 1)) : easeMix(u);
   const out = {};
   for (const k of KEYF) {
     if (k === 'ds') {
@@ -400,8 +444,8 @@ const S = {
   screen: { fit: 'cover', zoom: 1, offX: 0, offY: 0, bg: '#000000' },
   pose: { x: 0, y: 0, scale: 1, rx: 0, ry: 0, rz: 0, persp: 2600 },
   poseId: 'flat',
-  scene: { amount: 1, idle: 0.12, ease: 0.55 },   // ease: 0 — равномерно, 1 — максимально мягко
-  scenes: [{ id: 's1', sc: 'revealLow', t0: 0, dur: 10 }],   // сцены на дорожке
+  scene: { amount: 1, idle: 0, ease: 1, transition: 'cut', artDirection: true },   // ease: 0 — равномерно, 1 — максимально мягко
+  scenes: [{ id: 's1', sc: 'truckReveal', t0: 0, dur: 3.5 }],   // сцены на дорожке
   selScene: null,
   loop: false,
   thickK: 0.88,
@@ -419,7 +463,7 @@ const S = {
   selTrans: null,
   clips: [],                 // наезды: [{id,t0,dur,ramp,fill,u0,v0,u1,v1}]
   sel: null,                 // id выбранного наезда
-  exp: { fps: 30, bitrate: 14, audio: false, dur: 0 },
+  exp: { fps: 30, bitrate: 14, audio: false, dur: 0, autoDurationVersion: 1 },
   sizePreset: 'p1080',
   tl: { pps: 0 },             // масштаб таймлайна, пикселей на секунду; 0 — ещё не инициализирован
 };
@@ -1655,6 +1699,48 @@ function screenRectPx(quad, info) {
 /* ================================================= главный кадр ========= */
 
 function scenarioById(id) { return SCENARIOS.find(x => x.id === id) || SCENARIOS[0]; }
+const POSE_FIELDS = ['x', 'y', 'scale', 'rx', 'ry', 'rz', 'persp', 'lx', 'ly'];
+function validCustomScene(b) {
+  return b.sc === 'custom' && [b.from, b.to].every(p => p &&
+    POSE_FIELDS.every(k => Number.isFinite(p[k])) && p.scale > 0 && p.persp > 0);
+}
+function sceneDefinition(b) {
+  return b.sc === 'custom'
+    ? { name: 'Свой кадр', dur: b.dur, hint: 'Плавный переход к твоей позе. Положение задаёт конечный кадр; длину перехода меняй за край блока.' }
+    : scenarioById(b.sc);
+}
+function customPose(b, t) {
+  const list = sortedScenes(), prev = list[list.findIndex(x => x.id === b.id) - 1];
+  // Соседние пользовательские планы остаются соединёнными и после правки предыдущего.
+  const from = prev && prev.sc === 'custom' && Math.abs(sceneEnd(prev) - b.t0) < .01 ? prev.to : b.from;
+  const u = EASES.smooth(clamp(t / b.dur, 0, 1)), pose = {};
+  for (const k of POSE_FIELDS) {
+    pose[k] = k === 'scale' || k === 'persp'
+      ? Math.exp(lerp(Math.log(from[k]), Math.log(b.to[k]), u))
+      : lerp(from[k], b.to[k], u);
+  }
+  return pose;
+}
+function poseEditBlock() {
+  const selected = S.scenes.find(b => b.id === S.selScene && b.sc === 'custom');
+  if (selected && Math.abs(clock - sceneEnd(selected)) < .001) return selected;
+  const at = sceneAt(clock);
+  return at && at.block.sc === 'custom' ? at.block : null;
+}
+function editablePose() {
+  const b = poseEditBlock();
+  return b ? b.to : S.pose;
+}
+function beginPoseEdit(history = true) {
+  const b = poseEditBlock();
+  if (b) {
+    if (history) pushHist();
+    setPlaying(false);
+    seekTo(sceneEnd(b));
+  }
+  return b ? b.to : S.pose;
+}
+
 function sceneEnd(b) { return b.t0 + b.dur; }
 function sortedScenes() { return S.scenes.slice().sort((a, b) => a.t0 - b.t0); }
 
@@ -1667,12 +1753,12 @@ function sceneAt(t) {
   let cur = null;
   for (const b of list) { if (t >= b.t0) cur = b; else break; }
   if (!cur) return { block: list[0], local: 0 };
-  const sc = scenarioById(cur.sc);
+  const sc = sceneDefinition(cur);
   const local = (t - cur.t0) / Math.max(0.1, cur.dur) * sc.dur;
   return { block: cur, local };
 }
 
-/* Уход в чёрное на стыках соседних сцен: последняя доля секунды одной и
+/* Опциональный уход в чёрное на стыках сцен: последняя доля секунды одной и
    первая — следующей. Между несмежными блоками затемнения нет.             */
 function sceneFade(t) {
   const list = sortedScenes();
@@ -1680,12 +1766,12 @@ function sceneFade(t) {
   for (let i = 0; i < list.length; i++) {
     const b = list[i];
     const prev = list[i - 1], next = list[i + 1];
-    const half = REEL_GAP / 2;
-    if (next && Math.abs(next.t0 - sceneEnd(b)) < 0.05) {
+    const half = Math.min(REEL_GAP / 2, b.dur / 2, prev ? prev.dur / 2 : Infinity, next ? next.dur / 2 : Infinity);
+    if (next && (next.transition || S.scene.transition) === 'dip' && Math.abs(next.t0 - sceneEnd(b)) < 0.05) {
       const dt = sceneEnd(b) - t;                       // конец блока
       if (dt >= 0 && dt < half) f = Math.max(f, 1 - dt / half);
     }
-    if (prev && Math.abs(b.t0 - sceneEnd(prev)) < 0.05) {
+    if (prev && (b.transition || S.scene.transition) === 'dip' && Math.abs(b.t0 - sceneEnd(prev)) < 0.05) {
       const dt = t - b.t0;                              // начало блока
       if (dt >= 0 && dt < half) f = Math.max(f, 1 - dt / half);
     }
@@ -1729,13 +1815,14 @@ function composedPose(t) {
   const d = { dx: 0, dy: 0, ds: 0, drx: 0, dry: 0, drz: 0, lx: 0, ly: 0 };
 
   const at = sceneAt(t);
+  if (at && at.block.sc === 'custom') return customPose(at.block, at.local);
   if (at) {
     const k = evalScenario(at.local, scenarioById(at.block.sc));
     if (k) for (const f of KEYF) d[f] += (k[f] || 0) * (f === 'lx' || f === 'ly' ? 1 : A);
   }
 
-  if (S.scene.idle > 0) {
-    const i = idleDrift(t);
+  if (S.scene.idle > 0 && (!at || at.block.sc !== 'loopOrbit')) {
+    const i = idleDrift(at ? Math.min(at.local, scenarioById(at.block.sc).dur) : t);
     for (const f of ['dx', 'dy', 'ds', 'drx', 'dry', 'drz']) d[f] += i[f] * S.scene.idle;
   }
 
@@ -2134,12 +2221,20 @@ function bind(id, path, kind, after) {
     return el.value;
   };
   const write = () => {
-    const v = getPath(S, path);
+    const v = path.startsWith('pose.') ? editablePose()[path.slice(5)] : getPath(S, path);
     if (kind === 'bool') el.checked = !!v; else el.value = v;
     if (out) out.textContent = fmt(id, el.value);
   };
+  let poseGesture = false;
+  el.addEventListener('change', () => { poseGesture = false; });
   el.addEventListener('input', () => {
-    setPath(S, path, read());
+    const value = read();
+    if (path.startsWith('pose.')) {
+      const target = beginPoseEdit(!poseGesture);
+      poseGesture = true;
+      target[path.slice(5)] = value;
+      el.value = value;
+    } else setPath(S, path, value);
     if (out) out.textContent = fmt(id, el.value);
     if (after) after();
     save();
@@ -2449,14 +2544,14 @@ function loadVideoUrl(url) {
 /* Снимок держит то, что реально правится монтажом: три дорожки, переходы,
    что сейчас выбрано, и клок — иначе после undo плейхед остаётся там, где
    его застала операция, а не там, где он был до неё (см. B.1 в брифе).
-   Поза/устройство/экспорт и т.п. в историю не попадают — им отдельный undo
-   не нужен и не запрашивался.                                             */
+   Постановка и длительность тоже входят в снимок: применение ролика
+   должно отменяться вместе с его светом и камерой.                                             */
 const hist = { undo: [], redo: [] };
 function snap() {
   return JSON.stringify({
     media: S.media, clips: S.clips, scenes: S.scenes, trans: S.trans,
     selMedia: S.selMedia, sel: S.sel, selScene: S.selScene, selTrans: S.selTrans,
-    clock,
+    clock, direction: { pose: S.pose, poseId: S.poseId, scene: S.scene, bg: S.bg, glare: S.glare, vignette: S.vignette, exportDuration: S.exp.dur },
   });
 }
 function updateHistButtons() {
@@ -2473,7 +2568,14 @@ function applySnap(s) {
   const o = JSON.parse(s);
   S.media = o.media; S.clips = o.clips; S.scenes = o.scenes; S.trans = o.trans || [];
   S.selMedia = o.selMedia; S.sel = o.sel; S.selScene = o.selScene; S.selTrans = o.selTrans || null;
+  if (o.direction) {
+    const d = o.direction;
+    Object.assign(S.pose, d.pose); S.poseId = d.poseId;
+    Object.assign(S.scene, d.scene); Object.assign(S.bg, d.bg); Object.assign(S.glare, d.glare);
+    S.vignette = d.vignette; S.exp.dur = d.exportDuration;
+  }
   if (isFinite(o.clock)) clock = o.clock;
+  if (o.direction) syncDirectionUI();
 }
 function undo() {
   if (!hist.undo.length) return;
@@ -2897,8 +2999,9 @@ canvas.addEventListener('pointerdown', e => {
     selDrag = { u0: u, v0: v, u1: u, v1: v, ax: u, ay: v };
     return;
   }
+  const target = beginPoseEdit();
   canvas.classList.add('drag');
-  drag = { x: e.clientX, y: e.clientY, px: S.pose.x, py: S.pose.y, rx: S.pose.rx, ry: S.pose.ry, shift: e.shiftKey };
+  drag = { x: e.clientX, y: e.clientY, target, px: target.x, py: target.y, rx: target.rx, ry: target.ry, shift: e.shiftKey };
 });
 canvas.addEventListener('pointermove', e => {
   if (selecting) {
@@ -2914,13 +3017,13 @@ canvas.addEventListener('pointermove', e => {
   const dx = (e.clientX - drag.x) / r.width;
   const dy = (e.clientY - drag.y) / r.height;
   if (drag.shift || e.shiftKey) {
-    S.pose.ry = clamp(drag.ry + dx * 140, -55, 55);
-    S.pose.rx = clamp(drag.rx - dy * 140, -55, 55);
+    drag.target.ry = clamp(drag.ry + dx * 140, -55, 55);
+    drag.target.rx = clamp(drag.rx - dy * 140, -55, 55);
     S.poseId = '';
     syncPoseUI();
   } else {
-    S.pose.x = clamp(drag.px + dx, -0.6, 0.6);
-    S.pose.y = clamp(drag.py + dy, -0.6, 0.6);
+    drag.target.x = clamp(drag.px + dx, -0.6, 0.6);
+    drag.target.y = clamp(drag.py + dy, -0.6, 0.6);
     $('#pX')._sync(); $('#pY')._sync();
   }
 });
@@ -2942,7 +3045,8 @@ canvas.addEventListener('pointermove', e => {
 }));
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
-  S.pose.scale = clamp(S.pose.scale * (1 - e.deltaY * 0.0015), 0.25, 2.2);
+  const target = beginPoseEdit();
+  target.scale = clamp(target.scale * (1 - e.deltaY * 0.0015), 0.25, 2.2);
   $('#pScale')._sync(); save();
 }, { passive: false });
 
@@ -2968,11 +3072,13 @@ function setPlaying(v) {
   $('#btnPlay').textContent = v ? '❚❚' : '▶';
   if (v && clock >= sceneDuration() - 0.02) seekTo(0);
   syncMedia(clock, v);
+  if (!v) syncPoseUI();
 }
 
 function seekTo(t) {
   clock = clamp(t, 0, sceneDuration());
   syncMedia(clock, playing);
+  syncPoseUI();
 }
 
 $('#btnPlay').addEventListener('click', () => setPlaying(!playing));
@@ -3340,17 +3446,49 @@ function addScene(scId, at, want) {
   return b;
 }
 
+function addCustomScene(duration = 3) {
+  const dur = clamp(Number(duration) || 3, .3, 120);
+  const t0 = Math.round(Math.max(clock, 0, ...S.scenes.map(sceneEnd)) * 100) / 100;
+  const pose = composedPose(t0);
+  pushHist();
+  const b = { id: newSceneId(), sc: 'custom', t0, dur,
+    from: { ...pose }, to: { ...pose }, transition: 'cut' };
+  S.scenes.push(b);
+  S.selScene = b.id;
+  // Пользователь явно продлевает ролик: экспорт должен включать новый кадр.
+  if (S.exp.dur > 0) S.exp.dur = Math.max(S.exp.dur, sceneEnd(b));
+  setPlaying(false);
+  seekTo(sceneEnd(b));
+  syncPoseUI();
+  if ($('#expDur')._sync) $('#expDur')._sync();
+  fitZoom(); renderTimeline(); save();
+  toast('Свой кадр добавлен. Задай конечную позу мышью или в разделе «Положение».');
+  return b;
+}
+
 /* Ролик: очищает дорожку и раскладывает сцены встык, начиная с нуля. */
 function applyReel(reel) {
   pushHist();
   S.scenes.length = 0;
   let t = 0;
-  for (const [scId, dur] of reel.seq) {
-    S.scenes.push({ id: newSceneId(), sc: scId, t0: Math.round(t * 100) / 100, dur });
+  for (const [scId, dur, transition = 'cut'] of reel.seq) {
+    S.scenes.push({ id: newSceneId(), sc: scId, t0: Math.round(t * 100) / 100, dur, transition });
     t += dur;
   }
   S.selScene = S.scenes[0] ? S.scenes[0].id : null;
+  if (S.scene.artDirection) {
+    const look = REEL_LOOKS[reel.look];
+    Object.assign(S.pose, { x: 0, y: 0, scale: 1, rx: 0, ry: 0, rz: 0, persp: 2600 });
+    S.poseId = 'flat';
+    Object.assign(S.scene, { amount: 1, idle: 0, ease: 1, transition: 'cut' });
+    Object.assign(S.bg, look.bg);
+    Object.assign(S.glare, { on: true, amt: look.glare });
+    S.vignette = look.vignette;
+    syncDirectionUI();
+  }
+  // Сценарий управляет камерой, а не обрезает исходное видео.
   S.exp.dur = 0;
+  if ($('#expDur')._sync) $('#expDur')._sync();
   seekTo(0);
   renderTimeline(); save();
   toast(`Ролик «${reel.name}»: ${S.scenes.length} сцен, ${t.toFixed(0)} с`);
@@ -3368,6 +3506,8 @@ function deleteScene(id) {
 
 function selectScene(id) {
   S.selScene = id;
+  const b = getScene(id);
+  if (b && b.sc === 'custom') { setPlaying(false); seekTo(sceneEnd(b)); }
   [...$('#trkScene').querySelectorAll('.clip')].forEach(el => el.classList.toggle('sel', el.dataset.id === id));
   updateSceneMeta();
   save();
@@ -3848,7 +3988,7 @@ function layoutMedia(m) {
 function layoutScene(b) {
   const el = $('#trkScene').querySelector(`.clip.scene[data-id="${b.id}"]`);
   if (!el) return;
-  const sc = scenarioById(b.sc);
+  const sc = sceneDefinition(b);
   const D = tlDur();
   el.style.left = tToPct(b.t0) + '%';
   el.style.width = Math.max(0.4, (b.dur / D) * 100) + '%';
@@ -4497,6 +4637,7 @@ function buildChips(host, items, isOn, onPick) {
     const b = document.createElement('button');
     b.className = 'chip' + (isOn(it) ? ' on' : '');
     b.textContent = it.name;
+    if (it.hint) b.title = `${it.tag || ''} · ${it.dur} с. ${it.hint}`;
     b.dataset.id = it.id;
     b.addEventListener('click', () => { onPick(it); save(); });
     host.appendChild(b);
@@ -4505,20 +4646,48 @@ function buildChips(host, items, isOn, onPick) {
 const markChips = (host, id) =>
   [...host.children].forEach(c => c.classList.toggle('on', c.dataset.id === id));
 
+function buildReelCards() {
+  const host = $('#reels');
+  host.replaceChildren();
+  for (const reel of REELS) {
+    const card = document.createElement('button');
+    card.className = `reel-card reel-${reel.look}`;
+    card.dataset.id = reel.id;
+    card.title = `Применить: ${reel.name}. ${reel.hint}`;
+    const frames = reel.seq.map(([id, dur]) => {
+      const sc = scenarioById(id), k = sc.keys[0];
+      const rotation = k.drz || 0;
+      const width = 14 * Math.cos((k.dry || 0) * RAD);
+      return `<span class="reel-shot" title="${sc.name} · ${dur} с"><svg viewBox="0 0 48 54" aria-hidden="true"><g transform="translate(24 26) rotate(${rotation})"><rect x="${-width / 2}" y="-17" width="${width}" height="34" rx="3"/><path d="M -2 -14 h 4"/></g></svg><small>${dur}с</small></span>`;
+    }).join('');
+    card.innerHTML = `<span class="reel-eyebrow">${reel.eyebrow}<span>${reel.duration} С</span></span><strong>${reel.name}</strong><span class="reel-description">${reel.hint}</span><span class="reel-storyboard">${frames}</span><span class="reel-beats">${reel.beats}</span>`;
+    card.addEventListener('click', () => applyReel(reel));
+    host.appendChild(card);
+  }
+}
+
+function syncDirectionUI() {
+  syncPoseUI();
+  for (const el of $$('input, select')) if (el._sync) el._sync();
+  for (const el of $$('#bgPresets .sw')) el.classList.toggle('on', el.dataset.id === S.bg.preset);
+}
+
 function syncPoseUI() {
   ['pRx', 'pRy', 'pRz', 'pScale', 'pX', 'pY', 'pPersp'].forEach(k => { const e = document.getElementById(k); if (e && e._sync) e._sync(); });
-  markChips($('#poses'), S.poseId);
+  markChips($('#poses'), poseEditBlock() ? '' : S.poseId);
 }
 
 function applyPose(p) {
-  S.pose.rx = p.rx; S.pose.ry = p.ry; S.pose.rz = p.rz;
-  S.poseId = p.id;
+  const target = beginPoseEdit();
+  target.rx = p.rx; target.ry = p.ry; target.rz = p.rz;
+  if (target === S.pose) S.poseId = p.id;
   syncPoseUI();
 }
 
 function resetPose() {
-  Object.assign(S.pose, { x: 0, y: 0, scale: 1, rx: 0, ry: 0, rz: 0, persp: 2600 });
-  S.poseId = 'flat';
+  const target = beginPoseEdit();
+  Object.assign(target, { x: 0, y: 0, scale: 1, rx: 0, ry: 0, rz: 0, persp: 2600 });
+  if (target === S.pose) S.poseId = 'flat';
   syncPoseUI();
   save();
   toast('Положение сброшено');
@@ -4554,9 +4723,11 @@ function buildUI() {
     const b = addScene(m.id);
     if (b) toast(`Сцена «${m.name}» добавлена на ${b.t0.toFixed(1)} с`);
   });
-  buildChips($('#reels'), REELS, () => false, applyReel);
+  buildReelCards();
+  $('#btnContinueScene').addEventListener('click', () => addCustomScene($('#continueDur').value));
+  $('#btnCustomScene').addEventListener('click', () => addCustomScene($('#continueDur').value));
   $('#scClear').addEventListener('click', () => {
-    S.scenes.length = 0; S.selScene = null; renderTimeline(); save(); toast('Дорожка сцен очищена');
+    pushHist(); S.scenes.length = 0; S.selScene = null; renderTimeline(); save(); toast('Дорожка сцен очищена');
   });
 
   // фоны
@@ -4625,6 +4796,11 @@ function buildUI() {
   bind('mAmount', 'scene.amount', 'num');
   bind('mIdle',   'scene.idle',    'num');
   bind('scEase',  'scene.ease',    'num');
+  bind('reelArtDirection', 'scene.artDirection', 'bool');
+  bind('sceneTransition', 'scene.transition', 'str', () => {
+    for (const b of S.scenes) delete b.transition;
+    updateSceneMeta();
+  });
   $('#tempoSlow').addEventListener('click', () => applyTempo(1.25));
   $('#tempoFast').addEventListener('click', () => applyTempo(0.8));
 
@@ -4751,16 +4927,28 @@ function buildUI() {
 }
 
 function updateSceneMeta() {
+  const list = sortedScenes();
+  for (const card of $$('#reels .reel-card')) {
+    const reel = REELS.find(r => r.id === card.dataset.id);
+    let cursor = 0;
+    const active = list.length === reel.seq.length && reel.seq.every(([id, dur], i) => {
+      const b = list[i], matches = b.sc === id && Math.abs(b.dur - dur) < .01 && Math.abs(b.t0 - cursor) < .01;
+      cursor += dur;
+      return matches;
+    });
+    card.classList.toggle('on', active);
+    card.setAttribute('aria-pressed', String(active));
+  }
   const el = $('#scMeta');
   const b = getScene(S.selScene) || sortedScenes()[0];
   if (!b) { el.textContent = 'Сцен нет. Нажми на приём — он встанет на дорожку в место плейхеда, или выбери готовый ролик.'; return; }
-  const sc = scenarioById(b.sc);
+  const sc = sceneDefinition(b);
   const rate = sc.dur ? b.dur / sc.dur : 1;
   el.innerHTML =
     `<b style="color:#c6ccdc">${sc.name}</b> · ${b.t0.toFixed(1)}–${sceneEnd(b).toFixed(1)} с` +
     (Math.abs(rate - 1) > 0.05 ? ` · темп ${rate.toFixed(2)}×` : '') +
     `<br>${sc.hint}` +
-    (S.scenes.length > 1 ? `<br><span style="color:#8b93a7">Всего сцен: ${S.scenes.length}, между соседними — уход в чёрное.</span>` : '');
+    (S.scenes.length > 1 ? `<br><span style="color:#8b93a7">Всего сцен: ${S.scenes.length}. Стыки: ${S.scenes.some(x => (x.transition || S.scene.transition) === 'dip') ? 'с затемнением' : 'прямые склейки'}.</span>` : '');
 }
 
 /* ================================================= сохранение ========== */
@@ -4773,6 +4961,24 @@ function save() {
     try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (_) {}
   }, 250);
 }
+// Предыдущая версия сохраняла длину готового ролика как жёсткий лимит
+// экспорта. Исправляем только узнаваемые старые пресеты, один раз.
+function migrateReelDuration(saved) {
+  if (!saved.exp || saved.exp.autoDurationVersion >= 1) return;
+  const list = sortedScenes();
+  const legacyReel = REELS.some(reel => {
+    if (S.exp.dur !== reel.duration || list.length !== reel.seq.length) return false;
+    let cursor = 0;
+    return reel.seq.every(([id, dur], i) => {
+      const b = list[i];
+      const matches = b.sc === id && Math.abs(b.dur - dur) < .01 && Math.abs(b.t0 - cursor) < .01;
+      cursor += dur;
+      return matches;
+    });
+  });
+  if (legacyReel) S.exp.dur = 0;
+}
+
 function load() {
   try {
     const raw = localStorage.getItem(KEY);
@@ -4818,7 +5024,7 @@ function load() {
     }
     if (S.selTrans && !S.trans.some(tr => tr.id === S.selTrans)) S.selTrans = null;
     if (!Array.isArray(S.scenes)) S.scenes = [];
-    S.scenes = S.scenes.filter(b => b && SCENARIOS.some(x => x.id === b.sc && x.dur > 0) && isFinite(b.t0) && b.dur > 0);
+    S.scenes = S.scenes.filter(b => b && (validCustomScene(b) || SCENARIOS.some(x => x.id === b.sc && x.dur > 0)) && isFinite(b.t0) && b.dur > 0);
     for (const b of S.scenes) {
       if (!b.id) b.id = newSceneId();
       const n = +String(b.id).replace(/\D/g, ''); if (n >= sceneSeq) sceneSeq = n + 1;
@@ -4839,6 +5045,7 @@ function load() {
       }
     }
     if (S.sel && !S.clips.some(c => c.id === S.sel)) S.sel = null;
+    migrateReelDuration(o);
   } catch (_) {}
 }
 
@@ -4980,7 +5187,7 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   addVideoFiles, addImageFile, deleteMedia, clearVideo, mediaDur, mediaAt, activeMedia, mediaKind,
   syncMedia, mediaPool, holdHead, holdTail, stats,
   restoreMedia, idb: { get: idbGet, keys: idbKeys, del: idbDelete, clear: idbClear },
-  addScene, applyReel, deleteScene, sceneFade, sceneAt,
+  addScene, addCustomScene, applyReel, deleteScene, sceneFade, sceneAt, composedPose,
   renderTimeline, buildFilmstrip, evalScenario, focusAt, sceneDuration, selectClip, seekTo,
   homography, hmap, setForceGrid: v => { forceGrid = v; },
   get last(){ return lastRender }, get lastCam(){ return lastCam }, get selecting(){ return selecting }, startSelect, endSelect,

@@ -78,6 +78,9 @@
         <div class="row"><label>Поворот ↔</label><input type="range" id="pRy" min="-55" max="55" step="0.5" value="0"><output></output></div>
         <div class="row"><label>Вращение ⟳</label><input type="range" id="pRz" min="-45" max="45" step="0.5" value="0"><output></output></div>
         <div class="row"><label>Перспектива</label><input type="range" id="pPersp" min="900" max="6000" step="50" value="2600"><output></output></div>
+        <div class="row"><label for="continueDur">Переход, с</label><input type="number" id="continueDur" min="0.3" max="120" step="0.1" value="3"></div>
+        <button class="primary" id="btnContinueScene">+ Продолжить своим кадром</button>
+        <div class="hint">Добавь кадр после сценария, затем задай его конечную позу ползунками или мышью. Повтори для следующего положения. Предыдущие сцены сохранят свои ракурсы.</div>
         <button class="ghost" id="resetPose">Сбросить положение</button>
         <div class="hint">На холсте: тяни мышью — двигать · <b>Shift</b>+тяни — вращать · колесо — размер</div>
       </div>
@@ -86,11 +89,14 @@
     <details open>
       <summary>4 · Сценарий ролика</summary>
       <div class="body">
-        <div class="meta"><b style="color:#c6ccdc">Готовые ролики</b> — раскладывают сцены на дорожку целиком:</div>
-        <div class="chips" id="reels"></div>
-        <div class="meta" style="margin-top:6px"><b style="color:#c6ccdc">Приёмы</b> — нажми, и сцена встанет в место плейхеда:</div>
+        <div class="director-intro"><span>PRODUCT FILMS</span><b>Сначала история.<br>Потом движение.</b><p>Выбери монтаж под свою задачу. Видео на экране остаётся твоим.</p></div>
+        <div class="row"><label for="reelArtDirection">Свет и камера</label><input type="checkbox" id="reelArtDirection" checked></div>
+        <div class="hint">Включено — применить постановку камеры, фон и блики ролика. Выключено — сохранить своё оформление. Выбор заменяет дорожку сцен; отмена — ⌘Z.</div>
+        <div class="reel-library" id="reels"></div>
+        <div class="meta" style="margin-top:6px"><b style="color:#c6ccdc">Отдельные планы</b> — нажми, и сцена встанет в место плейхеда:</div>
         <div class="chips" id="scenarios"></div>
         <div class="meta" id="scMeta"></div>
+        <div class="row"><label for="sceneTransition">Склейки</label><select id="sceneTransition"><option value="cut">Прямые</option><option value="dip">Через чёрное</option></select></div>
         <div class="row"><label>Сила сценария</label><input type="range" id="mAmount" min="0" max="1.6" step="0.01" value="1"><output></output></div>
         <div class="row"><label>Живость</label><input type="range" id="mIdle" min="0" max="1.5" step="0.01" value="0.12"><output></output></div>
         <div class="row"><label>Плавность</label><input type="range" id="scEase" min="0" max="1" step="0.01" value="0.55"><output></output></div>
@@ -99,8 +105,8 @@
           <button class="ghost" id="tempoFast">Быстрее ×0.8</button>
         </div>
         <button class="ghost" id="scClear">Очистить дорожку сцен</button>
-        <div class="hint">«Плавность» 0 — постоянная скорость, 100 — мягкий разгон и торможение; в середине пик скорости почти вдвое выше средней, поэтому на длинных отъездах ставь меньше. Масштаб интерполируется логарифмически: приближение читается как отношение, а не как разность, и «улёта» в конце нет. «Медленнее/быстрее» меняют длительность выбранной на дорожке сцены (сцены правее сдвигаются); если ни одна не выбрана — всей истории.</div>
-        <div class="hint">Каждая сцена — один приём продуктовой съёмки: проезд по экрану, взгляд снизу с отъездом, разворот с бликом, витрина с движущимся светом. На дорожке сцены тянутся и растягиваются; между соседними — уход в чёрное. После последней камера замирает, запись можно продолжать.</div>
+        <div class="hint">У каждого плана свой темп: раскрытие тормозит, проезд по экрану мягко разгоняется и тормозит, финал останавливается. «Плавность» 100% сохраняет авторский разгон и торможение, 0% делает скорость равномерной. «Медленнее/быстрее» меняют длительность выбранной на дорожке сцены (сцены правее сдвигаются); если ни одна не выбрана — всей истории.</div>
+        <div class="hint">После сценария камера замирает, а видео продолжается до конца исходника. Для более длинной записи укажи длительность в экспорте. Для Reels выбери 1080×1920. На прямом экране показывай главное действие; финальные секунды оставь под короткий призыв. «Бесконечный кадр» замыкает движение камеры; для полного бесшовного ролика видео на экране тоже должно быть зациклено.</div>
       </div>
     </details>
 
@@ -240,6 +246,7 @@
         <button id="btnRedo" class="tbtn" title="Повторить — ⌘⇧Z" disabled>↷</button>
         <div class="tc"><span id="tCur">0.0</span> / <span id="tDur">0.0</span> с</div>
         <button id="btnAddZoom" class="tbtn wide">+ Наезд</button>
+        <button id="btnCustomScene" class="tbtn" title="Продолжить сценарий своим положением камеры">+ Свой кадр</button>
         <button id="btnAddScale" class="tbtn wide" title="Телефон крупнее на отрезке">+ Масштаб</button>
         <button id="btnSplit" class="tbtn wide" title="S — разделить по плейхеду" disabled>✂ Разделить</button>
         <button id="btnTrimL" class="tbtn wide" title="Q" disabled>⇤ Отрезать до</button>

@@ -288,3 +288,26 @@ button.ghost{background:transparent}
   #panel{order:2;max-height:46vh;border-right:none;border-top:1px solid var(--line)}
   #main{order:1;min-height:0}
 }
+
+/* Режиссёрская библиотека */
+.director-intro{padding:8px 0 4px}
+.director-intro>span{font-size:9px;letter-spacing:.2em;color:#9aaed6}
+.director-intro>b{display:block;font-size:25px;line-height:1.13;font-weight:560;letter-spacing:-.045em;margin:9px 0}
+.director-intro p{font-size:12px;line-height:1.5;color:var(--dim);margin:0}
+.reel-library{display:grid;gap:10px}
+.reel-card{display:flex;flex-direction:column;gap:8px;text-align:left;padding:14px;border:1px solid #343944;background:linear-gradient(130deg,#242731,#161820);border-radius:12px;overflow:hidden;transition:border-color .15s,transform .15s}
+.reel-card:hover{border-color:#8c9cb8;background:linear-gradient(130deg,#2d313e,#1d222d);transform:translateY(-1px)}
+.reel-card:focus-visible{outline:2px solid var(--acc);outline-offset:3px}
+.reel-pearl{background:linear-gradient(130deg,#e7e3db,#c9c5be);color:#24272d;border-color:#e7e3db}
+.reel-pearl:hover{background:linear-gradient(130deg,#f3f0eb,#d7d1c8);border-color:#fff}
+.reel-eyebrow{display:flex;justify-content:space-between;font-size:8px;letter-spacing:.17em;opacity:.7}
+.reel-card>strong{font-size:20px;font-weight:570;line-height:1.12;letter-spacing:-.035em}
+.reel-description{font-size:11px;font-weight:400;line-height:1.5;opacity:.72}
+.reel-storyboard{display:flex;gap:4px;margin-top:3px}
+.reel-shot{flex:1;min-width:0;display:flex;align-items:center;flex-direction:column;border:1px solid #ffffff16;background:#ffffff06;border-radius:5px;padding:2px 0 4px}
+.reel-pearl .reel-shot{border-color:#24272d20;background:#ffffff24}
+.reel-shot svg{height:48px;width:100%;fill:#78859120;stroke:currentColor;stroke-width:.8}
+.reel-shot small{font-size:8px;font-weight:400;opacity:.65}
+.reel-beats{font-size:9px;font-weight:400;opacity:.65;line-height:1.5}
+
+.reel-card.on{box-shadow:inset 0 0 0 2px #91aefa;border-color:#91aefa}
