@@ -313,6 +313,23 @@ function evalScenario(t, sc) {
 function applyTempo(k) {
   const list = sortedScenes();
   if (!list.length) { toast('На дорожке нет сцен'); return; }
+  pushHist();
+  const sel = getScene(S.selScene);
+  if (sel) {
+    // Темп только выбранной сцены: она удлиняется или укорачивается на месте,
+    // а всё, что стоит правее, сдвигается на ту же разницу — промежутки и
+    // порядок остаются прежними. Без выбора — как раньше, вся история.
+    const oldEnd = sceneEnd(sel);
+    const dur = Math.round(Math.max(0.3, sel.dur * k) * 100) / 100;
+    const delta = dur - sel.dur;
+    sel.dur = dur;
+    for (const b of list) if (b !== sel && b.t0 >= oldEnd - 1e-3) b.t0 = Math.round((b.t0 + delta) * 100) / 100;
+    S.exp.dur = 0;
+    renderTimeline(); updateSceneMeta(); save();
+    const name = sceneDefinition(sel).name.split(' → ')[0].split(' · ')[0];
+    toast(k > 1 ? `«${name}» медленнее в ${k.toFixed(2)}×` : `«${name}» быстрее в ${(1 / k).toFixed(2)}×`);
+    return;
+  }
   let cursor = 0, prevEnd = 0;
   for (const b of list) {
     const gap = Math.max(0, b.t0 - prevEnd) * k;
