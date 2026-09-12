@@ -3524,6 +3524,27 @@ function onClipDown(e, id, mode) {
     const th = clipEl ? clipEl.querySelector('canvas.thumbs') : null;
     if (th) { clipDrag.thumbsEl = th; clipDrag.thumbsW = th.getBoundingClientRect().width; }
   }
+  // Перестановка перетаскиванием (дорожка видео, режим 'move'): вместо
+  // клампа по соседям запоминаем раскладку слотов на старте драга — order
+  // (id по t0) и gaps (промежутки между соседями, они не меняются свопом,
+  // меняются только его "жильцы"), idx — место перетаскиваемого клипа в
+  // order, home — слот, куда он встанет, если его отпустить прямо сейчас.
+  // См. pointermove ниже и README.
+  if (isMediaId(id) && mode === 'move') {
+    const order = sortedMedia().map(m => m.id);
+    const gaps = [];
+    for (let i = 0; i < order.length - 1; i++) {
+      gaps.push(getMedia(order[i + 1]).t0 - mediaEnd(getMedia(order[i])));
+    }
+    clipDrag.order = order;
+    clipDrag.gaps = gaps;
+    clipDrag.idx = order.indexOf(id);
+    clipDrag.idx0 = clipDrag.idx;         // стартовый слот — чтобы на pointerup отличить
+                                           // реальный своп от драга без перестановки (см. ниже)
+    clipDrag.home = c.t0;
+    const el = e.target.closest('.clip.media');
+    if (el) el.classList.add('dragging');
+  }
   try { e.target.setPointerCapture(e.pointerId); } catch (_) {}
 }
 
@@ -3540,7 +3561,65 @@ window.addEventListener('pointermove', e => {
   const hiBound = hiCand.length ? Math.min(D, ...hiCand) : D;
   const snapOn = !e.altKey;
 
-  if (clipDrag.mode === 'move') {
+  if (clipDrag.mode === 'move' && isMediaId(clipDrag.id)) {
+    // Перестановка (см. onClipDown выше и README): клип свободно едет за
+    // курсором — clamp по соседям тут больше не делаем, вместо него ниже
+    // свопаем его с соседом, когда середина одного проходит середину
+    // другого. Снизу всё равно ограничиваем нулём — влезть в отрицательное
+    // время нельзя, а вправо клип может временно уйти за соседа/за край
+    // (это нормально, см. .dragging и "может временно перекрывать" в
+    // брифе) — фактическое место внутри слота дожимается на pointerup.
+    const rawT0 = clipDrag.t0 + d;
+    let cur = rawT0;
+    if (snapOn) {
+      const s0 = snapT(rawT0, c.id);
+      if (s0 !== rawT0) cur = s0;
+      else {
+        const rawEnd = rawT0 + clipDrag.dur;
+        const sEnd = snapT(rawEnd, c.id);
+        if (sEnd !== rawEnd) cur = sEnd - clipDrag.dur;
+      }
+    }
+    // centerD — от «сырого» cur, ДО пола в 0: иначе центр клипа длиннее
+    // первого соседа физически не может опуститься ниже c.dur/2 и никогда
+    // не пересечёт центр слота 0, сколько его ни тащи влево (см. находку).
+    // На саму позицию клипа (c.t0 = cur ниже) пол по-прежнему действует.
+    const centerD = cur + c.dur / 2;
+    cur = Math.max(0, cur);
+    const order = clipDrag.order, gaps = clipDrag.gaps;
+    // Вправо: пока следующий в order-слоте сосед N существует и середина
+    // перетаскиваемого клипа перескочила его середину — меняем местами.
+    // Промежуток gap (тот, что был между слотами) сохраняется — двигается
+    // только "жилец" каждого слота, поэтому клипы за пределами пары не
+    // трогаются (см. D.2 в брифе). Цикл while — можно перепрыгнуть сразу
+    // нескольких соседей за одно движение мыши.
+    while (clipDrag.idx < order.length - 1) {
+      const N = getMedia(order[clipDrag.idx + 1]);
+      if (!N || centerD <= N.t0 + N.dur / 2) break;
+      const gap = gaps[clipDrag.idx];
+      N.t0 = Math.round(clipDrag.home * 100) / 100;
+      clipDrag.home = Math.round((N.t0 + N.dur + gap) * 100) / 100;
+      order[clipDrag.idx] = N.id; order[clipDrag.idx + 1] = c.id;
+      clipDrag.idx++;
+      layoutMedia(N);
+    }
+    // Влево — симметрично: сосед P занимает слот сразу после нового
+    // положения перетаскиваемого клипа, с тем же промежутком gap.
+    while (clipDrag.idx > 0) {
+      const P = getMedia(order[clipDrag.idx - 1]);
+      // Нестрогая граница (с эпсилоном, не строгое >=): иначе своп не
+      // срабатывает на точном тай-брейке центров — например, когда
+      // перетаскиваемый клип и сосед слева одной длины (см. находку, AC-O4).
+      if (!P || centerD - (P.t0 + P.dur / 2) > 1e-6) break;
+      const gap = gaps[clipDrag.idx - 1];
+      clipDrag.home = Math.round(P.t0 * 100) / 100;
+      P.t0 = Math.round((clipDrag.home + c.dur + gap) * 100) / 100;
+      order[clipDrag.idx - 1] = c.id; order[clipDrag.idx] = P.id;
+      clipDrag.idx--;
+      layoutMedia(P);
+    }
+    c.t0 = cur;
+  } else if (clipDrag.mode === 'move') {
     const rawT0 = clipDrag.t0 + d;
     let newT0 = rawT0;
     if (snapOn) {
@@ -3595,10 +3674,33 @@ window.addEventListener('pointermove', e => {
   else { layoutClip(c); updateFocusMeta(); }
 });
 
-window.addEventListener('pointerup', () => {
+function endClipDrag() {
   if (clipDrag) {
     const wasMedia = isMediaId(clipDrag.id);
     const c = wasMedia ? getMedia(clipDrag.id) : null;
+    if (wasMedia && clipDrag.mode === 'move' && c && clipDrag.order) {
+      // Приземление после перестановки: клип во время драга мог временно
+      // перекрывать соседей — тут его дожимаем в свободное место внутри
+      // актуального слота (order/idx уже отражают все свопы этого драга),
+      // а если места не хватает — прижимаем к соседу (см. D.3 в брифе).
+      const order = clipDrag.order, idx = clipDrag.idx;
+      const prev = idx > 0 ? getMedia(order[idx - 1]) : null;
+      const next = idx < order.length - 1 ? getMedia(order[idx + 1]) : null;
+      const prevEnd = prev ? mediaEnd(prev) : 0;
+      // Последний слот (next нет): если в этом драге реально был своп (idx
+      // сместился от стартового idx0), верхнюю границу берём из clipDrag.home
+      // — он уже несёт сохранённый промежуток до места, где раньше кончался
+      // контент (см. находку — было tlDur(), т.е. видимая длина ВСЕЙ
+      // дорожки, а не конец контента, из-за чего верхний клам не работал и
+      // клип оставался там, где его бросили, с дырой перед ним). Если свопа
+      // не было (клип и так был последним/единственным) — это обычное
+      // перемещение, а не перестановка: оставляем свободный ход до конца
+      // дорожки, как раньше.
+      const swapped = idx !== clipDrag.idx0;
+      const nextStart = next ? next.t0 : (swapped ? clipDrag.home + c.dur : tlDur());
+      c.t0 = clamp(c.t0, prevEnd, Math.max(prevEnd, nextStart - c.dur));
+      c.t0 = Math.round(c.t0 * 100) / 100;
+    }
     const changed = !!c && (c.inPoint !== clipDrag.inPoint || c.dur !== clipDrag.dur);
     if (snap() !== clipDrag.snap) pushHist(clipDrag.snap);
     clipDrag = null;
@@ -3606,7 +3708,12 @@ window.addEventListener('pointerup', () => {
     if (wasMedia && changed) scheduleStrip();
     save();
   }
-});
+}
+// pointercancel — не только pointerup: без него отменённый жест (потеря
+// capture, системный жест поверх) оставлял clipDrag висеть, а класс
+// .dragging (см. onClipDown) — на элементе до следующего renderTimeline
+// (см. находку).
+['pointerup', 'pointercancel'].forEach(ev => window.addEventListener(ev, endClipDrag));
 
 /* --- ручки на маркере перехода: протяжка длительности прямо на дорожке
    (см. A в брифе) --- */
@@ -4868,4 +4975,5 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   setZoom, fitZoom, layoutTimeline, contentW, tlViewW, updatePlayhead,
   get tl() { return S.tl },
   get trDrag() { return trDrag },
+  get clipDrag() { return clipDrag },
   get clock() { return clock } };

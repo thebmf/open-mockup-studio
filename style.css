@@ -164,6 +164,10 @@ button.ghost{background:transparent}
 .clip{position:absolute;top:3px;bottom:3px;border-radius:6px;background:linear-gradient(180deg,#4b6ae0,#3550b4);
   border:1px solid #6d8bff;cursor:grab;overflow:hidden;z-index:2;min-width:14px}
 .clip.sel{outline:2px solid #9fb6ff;outline-offset:-1px;z-index:5}
+/* Перетаскиваемый клип (перестановка местами, см. app.js/onClipDown) —
+   выше соседей и маркеров стыка, чтобы не проваливался под них, пока
+   временно наезжает при свопе. */
+.clip.dragging{z-index:7}
 .clip:active{cursor:grabbing}
 .clip b{position:absolute;left:8px;top:50%;transform:translateY(-50%);font-size:10.5px;font-weight:600;color:#fff;
   white-space:nowrap;pointer-events:none;text-shadow:0 1px 2px #0006;z-index:1}
