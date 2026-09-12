@@ -648,6 +648,7 @@ let playing = false;
 let clock = 0;              // время сцены, с
 let lastTs = 0;
 let recording = false;
+let rendering = false;      // офлайн-рендер (см. renderOffline) — rAF-цикл ниже на время рендера холостой
 let grainTile = null;
 
 /* off-screen холст, куда рисуется сам телефон «плоско» */
@@ -2293,8 +2294,8 @@ function toast(msg, ms = 2600) {
 
 function setCanvasSize(w, h) {
   // Смена разрешения на лету рвёт поток H.264 — итоговый mp4 окажется битым.
-  if (recording) {
-    toast('Размер кадра нельзя менять во время записи');
+  if (recording || rendering) {
+    toast(rendering ? 'Размер кадра нельзя менять во время рендера' : 'Размер кадра нельзя менять во время записи');
     $('#cw').value = S.cw; $('#ch').value = S.ch;
     return;
   }
@@ -4512,6 +4513,10 @@ function loop(ts) {
 function frame(ts) {
   const dt = clamp(lastTs ? (ts - lastTs) / 1000 : 0, 0, 0.25);
   lastTs = ts;
+  // Офлайн-рендер (см. renderOffline) сам двигает clock и сам зовёт draw()
+  // строго в моменты i/fps — обычный игровой цикл тут должен молчать,
+  // иначе он тут же перетянет clock на реальное время и собьёт кадры.
+  if (rendering) return;
   const D = sceneDuration();
   const md = mediaDur();
 
@@ -4633,7 +4638,7 @@ document.addEventListener('visibilitychange', () => { if (recording && document.
 let starting = false;
 
 async function startRecording() {
-  if (recording || starting) return;
+  if (recording || starting || rendering) return;
   starting = true;
   try { await beginRecording(); } finally { starting = false; }
 }
@@ -4763,10 +4768,317 @@ function download(blob, name) {
 }
 
 $('#btnRecord').addEventListener('click', () => recording ? stopRecording() : startRecording());
-$('#ovCancel').addEventListener('click', () => { stopRecording(); });
+$('#ovCancel').addEventListener('click', () => { if (rendering) cancelRender(); else stopRecording(); });
 $('#btnPng').addEventListener('click', () => {
   canvas.toBlob(b => { download(b, `mockup-${S.cw}x${S.ch}.png`); toast('Кадр сохранён'); }, 'image/png');
 });
+
+/* ================================================= офлайн-рендер ======== */
+/* Обычная запись (см. выше) держится на MediaRecorder + canvas.captureStream
+   в реальном времени: поток отдаёт браузеру кадр тогда, когда тот сам решит,
+   что он готов, и если однажды draw(t) не уложился в 1/fps — а на слабой
+   машине с тяжёлой сценой (3D-корпус, блики, зерно) это почти гарантировано
+   — кодировщик просто недополучает кадр: получается лаг/дырка в файле,
+   которую постфактум не убрать.
+   Здесь кадры вообще не привязаны к реальному времени: рисуем их по одному,
+   строго в моменты i/fps, дожидаясь каждого столько, сколько нужно (перемотка
+   видео на playhead, requestVideoFrameCallback, toBlob), и лишь потом шлём
+   на локальный сервер serve.py — тот копит их в stdin ffmpeg (image2pipe),
+   который уже сам собирает mp4 с ровным fps и звуковой дорожкой отдельным
+   WAV, сведённым офлайн через OfflineAudioContext. Раз кадр нарисован —
+   он никуда не денется; ждать в этом цикле можно сколько угодно, лагов на
+   выходе просто неоткуда взяться. Кнопка «Записать» остаётся рабочей как
+   запасной путь — она не зависит от локального сервера и ffmpeg.         */
+
+let renderAvailable = false;   // ok:true и ffmpeg:true от /render/ping
+let renderCancelled = false;
+let renderJob = null;
+
+async function pingRenderServer() {
+  try {
+    const r = await fetch('/render/ping');
+    if (!r.ok) return { ok: false, ffmpeg: false };
+    return await r.json();
+  } catch (_) { return { ok: false, ffmpeg: false }; }
+}
+
+async function initRenderUI() {
+  const info = await pingRenderServer();
+  renderAvailable = !!(info && info.ok && info.ffmpeg);
+  setRenderButtonsEnabled(renderAvailable);
+  $('#renderHint').textContent = renderAvailable
+    ? 'Кадр за кадром через локальный ffmpeg: кадры не пропадаются даже на медленной машине; звук — из видео на дорожке.'
+    : 'Нужен локальный сервер (start.command / serve.py) и ffmpeg: brew install ffmpeg.';
+}
+
+function setRenderButtonsEnabled(v) {
+  $('#btnRender').disabled = !v;
+  $('#btnRender2').disabled = !v;
+}
+
+function cancelRender() {
+  if (!rendering) return;
+  renderCancelled = true;
+  $('#ovSub').textContent = 'Отменяю…';
+}
+
+/* Ждём одно событие с холостым таймаутом — и на 'seeked' видео, которое от
+   редких браузерных сбоев может вообще не прийти, и тогда без таймаута
+   рендер завис бы навсегда на одном кадре.                                */
+function waitEventOnce(el, evt, timeoutMs) {
+  return new Promise(resolve => {
+    let done = false;
+    const fin = () => { if (done) return; done = true; el.removeEventListener(evt, on); clearTimeout(tm); resolve(); };
+    const on = () => fin();
+    el.addEventListener(evt, on, { once: true });
+    const tm = setTimeout(fin, timeoutMs);
+  });
+}
+
+/* Рисует ровно один кадр офлайн-рендера в момент t: перематывает активное
+   видео на нужный local (та же арифметика стоп-кадра, что в syncMedia —
+   см. её комментарий про край natDur-0.03), ждёт, пока браузер реально
+   перемотает и отдаст этот кадр (событие 'seeked', затем, если браузер
+   умеет, requestVideoFrameCallback — иначе draw() иногда попадал бы на
+   кадр за миг ДО перемотки), и только потом рисует холст.                */
+async function renderFrameAt(t) {
+  clock = t;
+  const a = mediaAt(t);
+  if (a && a.pool.video) {
+    const v = a.pool.video, p = a.pool;
+    const edge = Math.max(0, p.natDur - 0.03);
+    const stop = a.local < 0 || a.local >= edge;
+    const want = stop ? (a.local < 0 ? 0 : edge) : clamp(a.local, 0, edge);
+    if (Math.abs(v.currentTime - want) > 1e-3) {
+      const seeked = waitEventOnce(v, 'seeked', 2000);
+      try { v.currentTime = want; } catch (_) {}
+      await seeked;
+      if (v.requestVideoFrameCallback) {
+        await new Promise(res => {
+          let done = false;
+          const fin = () => { if (!done) { done = true; res(); } };
+          try { v.requestVideoFrameCallback(fin); } catch (_) { fin(); }
+          setTimeout(fin, 150);
+        });
+      }
+    }
+  }
+  draw(t);
+}
+
+/* WAV PCM16 stereo, 44-байтный заголовок — простейший формат, который
+   ffmpeg понимает без дополнительных библиотек на фронте.                */
+function encodeWav(buffer) {
+  const numCh = buffer.numberOfChannels, sr = buffer.sampleRate, len = buffer.length;
+  const blockAlign = numCh * 2, dataSize = len * blockAlign;
+  const buf = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buf);
+  let o = 0;
+  const wStr = s => { for (let i = 0; i < s.length; i++) view.setUint8(o++, s.charCodeAt(i)); };
+  const w32 = v => { view.setUint32(o, v, true); o += 4; };
+  const w16 = v => { view.setUint16(o, v, true); o += 2; };
+  wStr('RIFF'); w32(36 + dataSize); wStr('WAVE');
+  wStr('fmt '); w32(16); w16(1); w16(numCh); w32(sr); w32(sr * blockAlign); w16(blockAlign); w16(16);
+  wStr('data'); w32(dataSize);
+  const chans = []; for (let c = 0; c < numCh; c++) chans.push(buffer.getChannelData(c));
+  for (let i = 0; i < len; i++) {
+    for (let c = 0; c < numCh; c++) {
+      const s = Math.max(-1, Math.min(1, chans[c][i]));
+      view.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      o += 2;
+    }
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+/* Достаёт исходный файл клипа для decodeAudioData: сперва IndexedDB (там
+   либо сам blob загруженного файла, либо url — для клипов, добавленных
+   через loadVideoUrl/?video=), и только если её нет — blob-URL из пула
+   (см. makePool/addVideoFile). Три пути ровно по тому же дереву источников,
+   что уже использует restoreMedia() при восстановлении проекта.          */
+async function fetchMediaArrayBuffer(m, p) {
+  try {
+    const rec = await idbGet(m.src);
+    if (rec) {
+      if (rec.blob) return await rec.blob.arrayBuffer();
+      if (rec.url) { const r = await fetch(rec.url); if (r.ok) return await r.arrayBuffer(); }
+    }
+  } catch (_) {}
+  if (p && p.url) { try { const r = await fetch(p.url); if (r.ok) return await r.arrayBuffer(); } catch (_) {} }
+  return null;
+}
+
+/* Сводит звук всей дорожки офлайн через OfflineAudioContext — быстрее
+   реального времени и не зависит от того, рисуется ли сейчас холст.
+   null означает «звука нет вообще» (все клипы — фото, или ни один файл не
+   декодировался) — тогда рендер идёт без аудио-потока, а не падает.       */
+async function renderAudioWav(dur) {
+  const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx = new Ctx(2, Math.max(1, Math.ceil(dur * 48000)), 48000);
+  const decodeCache = new Map();   // src -> Promise<AudioBuffer|null>, один клип может повторяться
+  let any = false;
+  for (const m of S.media) {
+    const p = mediaPool[m.id];
+    if (!p || p.kind === 'image' || !p.video) continue;   // фото без звука — сводить нечего
+    let bufP = decodeCache.get(m.src);
+    if (!bufP) {
+      bufP = (async () => {
+        const ab = await fetchMediaArrayBuffer(m, p);
+        if (!ab) return null;
+        try { return await ctx.decodeAudioData(ab); }
+        catch (err) { console.warn('renderAudioWav: не декодировался звук клипа', m.name, err); return null; }
+      })();
+      decodeCache.set(m.src, bufP);
+    }
+    const buf = await bufP;
+    if (!buf) continue;
+    const inPoint = m.inPoint || 0;
+    let at, offset, duration;
+    if (inPoint >= 0) {
+      at = m.t0; offset = inPoint;
+      duration = Math.min(m.dur, Math.max(0, buf.duration - inPoint));
+    } else {
+      // Стоп-кадр в начале клипа: живой звук стартует не с t0, а позже,
+      // ровно когда видео должно тронуться (см. ту же арифметику в syncMedia).
+      at = m.t0 - inPoint; offset = 0;
+      duration = Math.min(m.dur + inPoint, buf.duration);
+    }
+    if (duration <= 0) continue;
+    const node = ctx.createBufferSource();
+    node.buffer = buf;
+    node.connect(ctx.destination);
+    try { node.start(Math.max(0, at), offset, duration); }
+    catch (err) { console.warn('renderAudioWav: клип не встал в очередь', m.name, err); continue; }
+    any = true;
+  }
+  if (!any) return null;
+  const rendered = await ctx.startRendering();
+  return encodeWav(rendered);
+}
+
+/* Кадр за кадром собирает mp4 через локальный serve.py — см. брифинг в
+   начале раздела. Не завязан на rAF: тикает через await, поэтому работает
+   и в свёрнутой/фоновой вкладке, где обычная запись просто не рисовала бы
+   холст вообще.                                                          */
+async function renderOffline() {
+  if (recording || rendering) return;
+
+  const dur = sceneDuration();
+  const fps = +S.exp.fps || 30;
+  const N = Math.max(1, Math.round(dur * fps));
+  const W = S.cw, H = S.ch;
+  const withAudio = !!S.exp.audio;
+  const name = `mockup-${W}x${H}-${Math.round(dur)}s.mp4`;
+
+  const clock0 = clock;
+  setPlaying(false);
+  for (const id in mediaPool) { const p = mediaPool[id]; if (p.video) p.video.pause(); }
+
+  rendering = true;
+  renderCancelled = false;
+  renderJob = null;
+  let finishedOk = false;
+  setRenderButtonsEnabled(false);
+  $('#overlay').hidden = false;
+  $('#ovTitle').textContent = 'Рендер mp4…';
+  $('#ovBar').style.width = '0%';
+  $('#ovSub').textContent = `Кадр 0 / ${N} · 0.0 с`;
+  $('#ovCancel').disabled = false;
+
+  let result = null;
+  try {
+    const ping = await pingRenderServer();
+    if (!ping || !ping.ok || !ping.ffmpeg) {
+      throw new Error('Локальный сервер рендера недоступен — нужен serve.py и ffmpeg (brew install ffmpeg)');
+    }
+
+    const rNew = await fetch('/render/new', { method: 'POST' });
+    if (!rNew.ok) throw new Error('Не удалось создать задание рендера на сервере');
+    const { job } = await rNew.json();
+    renderJob = job;
+    if (renderCancelled) return null;
+
+    let hasAudio = false;
+    if (withAudio) {
+      $('#ovSub').textContent = 'Свожу звук…';
+      const wav = await renderAudioWav(dur);
+      if (renderCancelled) return null;
+      if (wav) {
+        const rAudio = await fetch(`/render/audio/${job}`, { method: 'POST', body: wav });
+        if (!rAudio.ok) throw new Error('Не удалось отправить звук на сервер');
+        hasAudio = true;
+      }
+    }
+
+    const rStart = await fetch(`/render/start/${job}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ fps, w: W, h: H, name, hasAudio, crf: 18 }),
+    });
+    if (!rStart.ok) {
+      const e = await rStart.json().catch(() => ({}));
+      throw new Error(e.error === 'ffmpeg not found'
+        ? 'ffmpeg не найден на сервере — brew install ffmpeg'
+        : ('Сервер не смог начать рендер: ' + (e.error || rStart.status)));
+    }
+
+    for (let i = 0; i < N; i++) {
+      if (renderCancelled) return null;
+      const t = i / fps;
+      await renderFrameAt(t);
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.95));
+      if (!blob) throw new Error('Не удалось получить кадр с холста');
+      if (renderCancelled) return null;
+      const rFrame = await fetch(`/render/frame/${job}`, { method: 'POST', body: blob });
+      if (!rFrame.ok) {
+        const e = await rFrame.json().catch(() => ({}));
+        throw new Error(`Кодировщик остановился на кадре ${i + 1}/${N}` + (e.stderr ? ('\n' + e.stderr.slice(-500)) : ''));
+      }
+      $('#ovBar').style.width = (((i + 1) / N) * 100).toFixed(1) + '%';
+      $('#ovSub').textContent = `Кадр ${i + 1} / ${N} · ${t.toFixed(1)} с`;
+    }
+    if (renderCancelled) return null;
+
+    $('#ovSub').textContent = 'Собираю mp4…';
+    const rFinish = await fetch(`/render/finish/${job}`, { method: 'POST' });
+    const fin = await rFinish.json().catch(() => ({}));
+    if (!rFinish.ok || !fin.ok) {
+      throw new Error('ffmpeg не смог собрать файл' + (fin.stderr ? ('\n' + fin.stderr.slice(-500)) : ''));
+    }
+    finishedOk = true;
+
+    const rGet = await fetch(`/render/file/${job}`);
+    if (!rGet.ok) throw new Error('Не удалось скачать готовый файл с сервера');
+    const outBlob = await rGet.blob();
+    download(outBlob, name);
+    $('#expMeta').innerHTML =
+      `Отрендерено: <b style="color:#c6ccdc">${name}</b><br>${(fin.bytes / 1048576).toFixed(1)} МБ · ${fin.frames} кадров`;
+    toast(`Готово: ${fin.frames} кадров, ${(fin.bytes / 1048576).toFixed(1)} МБ`, 4200);
+    result = { path: fin.path, frames: fin.frames, bytes: fin.bytes };
+  } catch (err) {
+    if (!renderCancelled) {
+      const msg = (err && err.message) || String(err);
+      console.error('renderOffline:', err);
+      toast('Рендер не удался: ' + msg.split('\n')[0] + ' — можно нажать «Записать» (реальное время)', 7000);
+      $('#expMeta').innerHTML = `<b style="color:#ff5f6d">Рендер не удался.</b><br>${msg.split('\n')[0]}`;
+    }
+  } finally {
+    rendering = false;
+    $('#overlay').hidden = true;
+    $('#ovTitle').textContent = 'Запись…';
+    $('#ovCancel').disabled = false;
+    setRenderButtonsEnabled(renderAvailable);
+    clock = clock0;
+    syncMedia(clock0, false);
+    updatePlayhead();
+    const job = renderJob; renderJob = null;
+    if (job && !finishedOk) { try { await fetch(`/render/cancel/${job}`, { method: 'POST' }); } catch (_) {} }
+  }
+  return result;
+}
+
+$('#btnRender').addEventListener('click', () => { renderOffline(); });
+$('#btnRender2').addEventListener('click', () => { renderOffline(); });
 
 /* ================================================= сборка UI =========== */
 
@@ -5327,6 +5639,7 @@ function init() {
 
   requestAnimationFrame(loop);
   setTimeout(fitCanvas, 60);
+  initRenderUI();   // асинхронно — /render/ping бьёт в локальный сервер, не блокирует запуск
 }
 init();
 
@@ -5351,4 +5664,5 @@ window.__ms = { S, draw, setCanvasSize, loadVideoUrl, DEVICES, SCENARIOS, REELS,
   get tl() { return S.tl },
   get trDrag() { return trDrag },
   get clipDrag() { return clipDrag },
-  get clock() { return clock } };
+  get clock() { return clock },
+  renderOffline, renderAudioWav, renderFrameAt, get rendering() { return rendering } };

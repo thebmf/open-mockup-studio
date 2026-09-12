@@ -212,6 +212,8 @@
         <div class="row"><label>Со звуком</label><input type="checkbox" id="withAudio"></div>
         <div class="row"><label>Длительность, с</label><input type="number" id="expDur" min="1" max="120" step="0.5" value="0"><span class="sfx">0 = длина видео</span></div>
         <button class="primary" id="btnRecord">● Записать видео</button>
+        <button class="primary" id="btnRender">⬇ Отрендерить mp4 (без лагов)</button>
+        <div class="hint" id="renderHint"></div>
         <button class="ghost" id="btnPng">Сохранить кадр PNG</button>
         <div class="meta" id="expMeta"></div>
       </div>
@@ -258,6 +260,7 @@
         <button id="btnZoomFit" class="tbtn" title="0 — по размеру">⤢</button>
         <div class="tc" id="dims">1080×1920</div>
         <button id="btnRecord2" class="tbtn recbtn">● Записать</button>
+        <button id="btnRender2" class="tbtn wide">⬇ Рендер</button>
       </div>
       <div id="tlwrap">
         <div id="tlcontent">
@@ -280,7 +283,7 @@
 
 <div id="overlay" hidden>
   <div class="card">
-    <div class="ov-title">Запись…</div>
+    <div class="ov-title" id="ovTitle">Запись…</div>
     <div class="bar"><i id="ovBar"></i></div>
     <div class="ov-sub" id="ovSub">Не переключай вкладку — запись идёт в реальном времени.</div>
     <button class="ghost" id="ovCancel">Отменить</button>
